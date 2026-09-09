@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.local
+
+# Data (large files)
+data/raw/*.csv
+data/raw/*.xlsx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------
+# 以下为开源发布补充规则（体积 / 隐私 / 可再生成产物）
+# ---------------------------------------------------------
+
+# 本地大模型权重（Ollama，约 6.5G）
+models/
+
+# 前端依赖与构建产物
+node_modules/
+web/dist/
+dist/
+
+# 数据库与检索索引：均由脚本可复现生成
+*.db
+*.db-wal
+*.db-shm
+data/chroma_db/
+data/index/
+data/logs/
+data/sim_clock.json
+
+# 个人隐私产物（简历 / 证件照 / 参考 PDF）
+outputs/
+
+# 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 临时调试文件
+_te.txt
+_to.txt
+error_screenshot.png
+
+# ---------------------------------------------------------
+# 个人隐私：含姓名 / 学号 / 班级的课程材料与简历
+# ---------------------------------------------------------
+
+# 课程项目日志（文件名含真实姓名与学号）
+/姓名_学号_班级_项目日志*.xlsx
+/钟祥健_*.xlsx
+/项目日志_已填充.xlsx
+/~$*
+~$*
+
+# 简历与个人证件材料
+*.pdf
+
+# WorkBuddy 项目数据（含工作记忆，不公开）
+.workbuddy/

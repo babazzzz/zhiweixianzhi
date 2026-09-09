@@ -1,0 +1,46 @@
+# ==========================================
+# 智维先知 LangGraph版 — 依赖清单
+# ==========================================
+# 安装命令（项目使用 .venv，Python 3.12）：
+# .venv\Scripts\pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 说明：版本号对齐 2026-09 实际在 .venv 中验证通过的组合。
+#       下限被刻意放宽，避免 pip 强行升级到大版本导致 API 不兼容。
+
+# --- LangGraph 核心 ---
+langgraph>=1.2.11,<2.0.0
+langgraph-checkpoint>=4.2.0,<5.0.0
+langgraph-prebuilt>=1.1.0,<2.0.0
+
+# --- LLM 集成 ---
+# 注意：项目通过 src/llm/client.py 用 httpx 直连 Ollama 与 DeepSeek，
+#       不依赖 langchain-openai / openai SDK。DeepSeek 走 OpenAI 兼容协议。
+langchain-core>=1.6.0,<2.0.0
+langchain-ollama>=1.1.0,<2.0.0
+langchain-community>=0.4.2,<0.5.0
+langchain-text-splitters>=1.1.2,<2.0.0
+httpx>=0.28.1,<0.29.0
+
+# --- 数据处理 ---
+numpy>=2.2.6,<3.0.0
+pandas>=2.3.3,<3.1.0
+scipy>=1.18.0,<2.0.0
+scikit-learn>=1.9.0,<2.0.0
+
+# --- Web 后端 ---
+fastapi>=0.128.0,<1.0.0
+uvicorn>=0.40.0,<1.0.0
+pydantic>=2.12.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# --- RAG 向量检索 ---
+# chromadb 1.5.9 已验证可用（PersistentClient + get_or_create_collection + query）。
+# bge-m3 嵌入模型由本地 Ollama 提供，无需额外 Python 包。
+chromadb>=1.5.9,<2.0.0
+jieba>=0.42.1,<0.43.0
+
+# --- 图算法（故障因果传播图）---
+networkx>=3.6.1,<4.0.0
+
+# --- 开发 / 测试 ---
+pytest>=8.0.0
