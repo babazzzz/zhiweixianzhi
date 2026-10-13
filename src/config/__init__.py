@@ -14,6 +14,19 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/zhiwei.db")
 _configured_data_dir = PROJECT_ROOT / os.getenv("DATA_DIR", "data")
 DATA_DIR = _configured_data_dir.parent if _configured_data_dir.name.lower() == "raw" else _configured_data_dir
 LOG_DIR = PROJECT_ROOT / os.getenv("LOG_DIR", "data/logs")
+
+# ==========================================
+# 认证与权限（JWT）
+#   * AUTH_SECRET：JWT 签名密钥，必须通过 .env 提供（勿使用默认值上线）；
+#   * ADMIN_USERNAME / ADMIN_PASSWORD：首次启动播种的管理员凭据；
+#   * 角色三级：admin（全部）/ operator（读 + 运维写）/ viewer（只读）。
+# ==========================================
+AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ROLES: tuple[str, ...] = ("admin", "operator", "viewer")
 SYSTEM_CONFIG: dict[str, int | str | Path] = {
     "max_parallel_devices": int(os.getenv("MAX_PARALLEL_DEVICES", "15")),
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
@@ -148,7 +161,8 @@ RISK_LEVELS: dict[str, dict] = {
 }
 
 __all__ = [
-    "AGENT_ROUTING", "DATABASE_URL", "DATA_DIR", "DATA_FILES", "EMBEDDING_MODEL",
-    "FAULT_MODELS", "LOG_DIR", "PROJECT_ROOT", "RISK_LEVELS", "SENSOR_COLUMNS",
+    "ADMIN_PASSWORD", "ADMIN_USERNAME", "AGENT_ROUTING", "AUTH_SECRET", "DATABASE_URL", "DATA_DIR",
+    "DATA_FILES", "EMBEDDING_MODEL", "FAULT_MODELS", "JWT_ALGORITHM", "JWT_EXPIRE_MINUTES",
+    "LOG_DIR", "PROJECT_ROOT", "RISK_LEVELS", "ROLES", "SENSOR_COLUMNS",
     "SYSTEM_CONFIG", "get_agent_config",
 ]

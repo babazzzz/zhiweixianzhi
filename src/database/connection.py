@@ -156,6 +156,15 @@ class Database:
                 source_detail TEXT NOT NULL, row_count INTEGER NOT NULL DEFAULT 0,
                 seed INTEGER, generated_at TEXT NOT NULL, notes TEXT NOT NULL DEFAULT ''
             )""",
+            # === 用户与认证：JWT 登录 + 三角色权限（admin / operator / viewer）===
+            """CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                display_name TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""",
         )
         with self.transaction() as connection:
             for statement in statements:
@@ -164,7 +173,7 @@ class Database:
     def count(self, table: str) -> int:
         """Return a row count for a trusted internal table name."""
 
-        allowed = {"machines", "sensor_readings", "fmeca_rules", "case_library", "diagnostics", "maintenance_records", "agent_activity", "notifications"}
+        allowed = {"machines", "sensor_readings", "fmeca_rules", "case_library", "diagnostics", "maintenance_records", "agent_activity", "notifications", "users"}
         if table not in allowed:
             raise ValueError("Unsupported table")
         with self.transaction() as connection:
@@ -600,6 +609,40 @@ class Database:
                 f"SELECT * FROM data_provenance {where} ORDER BY generated_at DESC LIMIT ?", params
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # === 用户与认证（JWT 登录 + 三角色权限）===
+
+    def create_user(self, *, username: str, password_hash: str, role: str = "viewer", display_name: str | None = None) -> str:
+        """创建一个登录用户，返回用户 ID。用户名唯一，冲突时抛 IntegrityError。"""
+
+        user_id = f"U-{uuid.uuid4().hex[:10].upper()}"
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO users (id,username,password_hash,role,display_name,created_at) VALUES (?,?,?,?,?,?)",
+                (user_id, username, password_hash, role, display_name or username, datetime.now().astimezone().isoformat()),
+            )
+        return user_id
+
+    def get_user_by_username(self, username: str) -> dict[str, object] | None:
+        """按用户名取用户（含 password_hash，仅供认证内部使用）。"""
+
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[dict[str, object]]:
+        """列出用户（不含密码哈希），供管理员维护账号。"""
+
+        with self.transaction() as connection:
+            rows = connection.execute("SELECT id, username, role, display_name, created_at FROM users ORDER BY created_at").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_user_role(self, username: str, role: str) -> bool:
+        """调整用户角色；返回是否更新成功。"""
+
+        with self.transaction() as connection:
+            cursor = connection.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+        return cursor.rowcount > 0
 
     @staticmethod
     def _machine_row(row: sqlite3.Row) -> dict[str, object]:

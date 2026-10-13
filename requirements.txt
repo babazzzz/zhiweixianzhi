@@ -33,6 +33,9 @@ uvicorn>=0.40.0,<1.0.0
 pydantic>=2.12.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
 
+# --- 认证（JWT 登录与角色权限）---
+PyJWT>=2.8.0,<3.0.0
+
 # --- RAG 向量检索 ---
 # chromadb 1.5.9 已验证可用（PersistentClient + get_or_create_collection + query）。
 # bge-m3 嵌入模型由本地 Ollama 提供，无需额外 Python 包。

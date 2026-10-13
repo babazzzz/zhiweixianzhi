@@ -21,6 +21,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.agents.autonomous_loop import ActivityBus, ActivityEvent, AutonomousLoop
+from src.api.security import AdminOnly, CurrentUser, OperatorUp, authenticate_websocket, create_access_token, ensure_admin_user, hash_password, verify_password
+from src.config import JWT_EXPIRE_MINUTES, ROLES
 from src.database.connection import Database
 from src.database.init_db import bootstrap_database
 from src.graph.main_graph import build_graph
@@ -105,11 +107,29 @@ class ReportPushRequest(BaseModel):
     webhook_url: str | None = Field(default=None, max_length=500, description="留空则用 .env 的 REPORT_WEBHOOK_URL")
 
 
+class LoginRequest(BaseModel):
+    """登录表单：用户名 + 密码，换取 JWT。"""
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class CreateUserRequest(BaseModel):
+    """管理员创建账号（演示三角色权限用）。"""
+
+    username: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=6, max_length=128)
+    role: str = Field(default="viewer", description="admin | operator | viewer")
+    display_name: str | None = Field(default=None, max_length=64)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Initialize local persistence and start the autonomous monitoring loop."""
 
     application.state.database = bootstrap_database()
+    # 认证：确保管理员账号存在（幂等播种，用户名/密码来自 .env 的 ADMIN_USERNAME/ADMIN_PASSWORD）
+    ensure_admin_user(application.state.database)
     application.state.fault_graph = FaultGraph()
     application.state.graph = build_graph(application.state.database, application.state.fault_graph)
     application.state.activity_bus = ActivityBus()
@@ -178,14 +198,14 @@ async def _run_diagnostic_for_loop(machine_id: str) -> dict[str, object]:
     return {**payload, "diagnostic_id": diagnostic_id, "machine_id": machine_id, "severity": state.get("severity"), "fault_name": state.get("fault_mode") or state.get("fault_name") or "未识别故障", "confidence": state.get("confidence"), "rul_p50": _rul_p50, "rul_hours": _rul_p50}
 
 
-app = FastAPI(title="智维先知企业级 Agent API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="智维先知企业级 Agent API", version="2.1.0", lifespan=lifespan)
 origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Trace-Id"],
 )
 
 
@@ -250,8 +270,63 @@ async def health() -> dict[str, object]:
     return {"status": "ok", "database": {"machines": database.count("machines"), "readings": database.count("sensor_readings"), "diagnostics": database.count("diagnostics")}, "llm": await UnifiedLLMClient(timeout_seconds=4.0).health_check()}
 
 
+# ============================================================================
+#  认证 API — JWT 登录 / 当前用户 / 账号管理（三角色：admin / operator / viewer）
+#  接口鉴权矩阵见 README「接口与鉴权」一节。
+# ============================================================================
+
+@app.post("/api/auth/login", tags=["auth"])
+async def login(request: LoginRequest) -> dict[str, object]:
+    """校验用户名密码，签发 JWT（后续请求带 Authorization: Bearer <token>）。"""
+
+    database = get_database()
+    user = database.get_user_by_username(request.username.strip())
+    if user is None or not verify_password(request.password, str(user["password_hash"])):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    role = str(user["role"])
+    token = create_access_token(str(user["username"]), role)
+    get_logger("api").info(json.dumps({"action": "login", "username": user["username"], "role": role}, ensure_ascii=False))
+    return {
+        "access_token": token, "token_type": "bearer",
+        "username": str(user["username"]), "role": role, "display_name": user.get("display_name"),
+        "expires_in": JWT_EXPIRE_MINUTES * 60,
+    }
+
+
+@app.get("/api/auth/me", tags=["auth"])
+async def current_user(user: CurrentUser) -> dict[str, object]:
+    """返回当前登录用户与角色（前端路由守卫与角色门控用）。"""
+
+    return user
+
+
+@app.get("/api/auth/users", tags=["auth"])
+async def list_users(_: AdminOnly) -> dict[str, object]:
+    """列出全部账号（仅管理员）。"""
+
+    items = get_database().list_users()
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/auth/users", tags=["auth"])
+async def create_user(request: CreateUserRequest, _: AdminOnly) -> dict[str, object]:
+    """创建账号（仅管理员）；角色必须是 admin / operator / viewer 之一。"""
+
+    if request.role not in ROLES:
+        raise HTTPException(status_code=400, detail=f"角色必须是 {' / '.join(ROLES)} 之一")
+    database = get_database()
+    if database.get_user_by_username(request.username) is not None:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    user_id = database.create_user(
+        username=request.username, password_hash=hash_password(request.password),
+        role=request.role, display_name=request.display_name,
+    )
+    get_logger("api").info(json.dumps({"action": "user_created", "username": request.username, "role": request.role}, ensure_ascii=False))
+    return {"id": user_id, "username": request.username, "role": request.role}
+
+
 @app.get("/api/overview", tags=["monitoring"])
-async def overview() -> dict[str, object]:
+async def overview(_: CurrentUser) -> dict[str, object]:
     """Return fleet KPIs calculated from the stored telemetry."""
 
     database = get_database()
@@ -275,7 +350,7 @@ async def overview() -> dict[str, object]:
 
 
 @app.get("/api/machines", tags=["machines"])
-async def list_machines(status: str | None = Query(default=None)) -> dict[str, object]:
+async def list_machines(_: CurrentUser, status: str | None = Query(default=None)) -> dict[str, object]:
     """List machines, optionally filtered by persisted status."""
 
     machines = get_database().list_machines(status)
@@ -292,7 +367,7 @@ async def list_machines(status: str | None = Query(default=None)) -> dict[str, o
 
 
 @app.get("/api/machines/{machine_id}", tags=["machines"])
-async def machine_detail(machine_id: str) -> dict[str, object]:
+async def machine_detail(_: CurrentUser, machine_id: str) -> dict[str, object]:
     """Return a machine profile, latest reading and recent diagnostics."""
 
     database = get_database()
@@ -310,7 +385,7 @@ async def machine_detail(machine_id: str) -> dict[str, object]:
 
 
 @app.get("/api/machines/{machine_id}/realtime", tags=["machines"])
-async def machine_realtime(machine_id: str) -> dict[str, object]:
+async def machine_realtime(_: CurrentUser, machine_id: str) -> dict[str, object]:
     """Return latest telemetry and a live anomaly result."""
 
     database = get_database()
@@ -323,7 +398,7 @@ async def machine_realtime(machine_id: str) -> dict[str, object]:
 
 
 @app.get("/api/machines/{machine_id}/history", tags=["machines"])
-async def machine_history(machine_id: str, limit: int = Query(default=240, ge=1, le=5000)) -> dict[str, object]:
+async def machine_history(_: CurrentUser, machine_id: str, limit: int = Query(default=240, ge=1, le=5000)) -> dict[str, object]:
     """Return chart-ready time series data."""
 
     return {"machine_id": machine_id, "items": get_database().get_readings(machine_id, limit)}
@@ -348,14 +423,14 @@ async def _run_diagnostic(request: DiagnosticRequest) -> dict[str, object]:
 
 
 @app.post("/api/diagnostics/trigger", tags=["diagnostics"])
-async def trigger_diagnostic(request: DiagnosticRequest) -> dict[str, object]:
+async def trigger_diagnostic(request: DiagnosticRequest, _: OperatorUp) -> dict[str, object]:
     """Trigger the event-driven Monitor→Diagnostic→Prediction→Decision workflow."""
 
     return await _run_diagnostic(request)
 
 
 @app.get("/api/diagnostics", tags=["diagnostics"])
-async def list_diagnostics(machine_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
+async def list_diagnostics(_: CurrentUser, machine_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
     """Return persisted diagnostic history."""
 
     items = get_database().list_diagnostics(machine_id, limit)
@@ -363,7 +438,7 @@ async def list_diagnostics(machine_id: str | None = Query(default=None), limit: 
 
 
 @app.get("/api/diagnostics/{diagnostic_id}", tags=["diagnostics"])
-async def diagnostic_detail(diagnostic_id: str) -> dict[str, object]:
+async def diagnostic_detail(_: CurrentUser, diagnostic_id: str) -> dict[str, object]:
     """Return one complete report and evidence chain."""
 
     item = get_database().get_diagnostic(diagnostic_id)
@@ -373,7 +448,7 @@ async def diagnostic_detail(diagnostic_id: str) -> dict[str, object]:
 
 
 @app.get("/api/knowledge/fmeca", tags=["knowledge"])
-async def list_fmeca() -> dict[str, object]:
+async def list_fmeca(_: CurrentUser) -> dict[str, object]:
     """Browse structured FMECA rules."""
 
     items = get_database().list_fmeca()
@@ -381,7 +456,7 @@ async def list_fmeca() -> dict[str, object]:
 
 
 @app.get("/api/knowledge/fmeca/{fault_code}", tags=["knowledge"])
-async def fmeca_detail(fault_code: int) -> dict[str, object]:
+async def fmeca_detail(_: CurrentUser, fault_code: int) -> dict[str, object]:
     """Return one FMECA rule and SOP."""
 
     item = get_database().get_fmeca(fault_code)
@@ -391,7 +466,7 @@ async def fmeca_detail(fault_code: int) -> dict[str, object]:
 
 
 @app.post("/api/knowledge/search", tags=["knowledge"])
-async def knowledge_search(request: KnowledgeSearchRequest) -> dict[str, object]:
+async def knowledge_search(request: KnowledgeSearchRequest, _: CurrentUser) -> dict[str, object]:
     """Hybrid knowledge search: BM25 + bge-m3 dense fused with RRF, plus FMECA/case results."""
 
     database = get_database()
@@ -422,7 +497,7 @@ async def knowledge_search(request: KnowledgeSearchRequest) -> dict[str, object]
 
 
 @app.get("/api/topology", tags=["knowledge"])
-async def topology() -> dict[str, object]:
+async def topology(_: CurrentUser) -> dict[str, object]:
     """Return a device→production-line→fault causal graph for the graph UI."""
 
     machines = get_database().list_machines()
@@ -437,7 +512,7 @@ async def topology() -> dict[str, object]:
 
 
 @app.get("/api/operations/orders", tags=["operations"])
-async def list_orders() -> dict[str, object]:
+async def list_orders(_: CurrentUser) -> dict[str, object]:
     """Return maintenance work orders."""
 
     items = get_database().list_maintenance_orders()
@@ -445,7 +520,7 @@ async def list_orders() -> dict[str, object]:
 
 
 @app.post("/api/operations/orders", tags=["operations"])
-async def create_order(request: MaintenanceOrderRequest) -> dict[str, object]:
+async def create_order(request: MaintenanceOrderRequest, _: OperatorUp) -> dict[str, object]:
     """Create a human-visible work order from a reviewed recommendation."""
 
     if get_database().get_machine(request.machine_id) is None:
@@ -498,8 +573,10 @@ hub = RealtimeHub()
 
 @app.websocket("/ws/realtime")
 async def realtime(socket: WebSocket) -> None:
-    """Push fleet snapshots and accept ping messages."""
+    """Push fleet snapshots and accept ping messages (token 走 ?token=)。"""
 
+    if await authenticate_websocket(socket) is None:
+        return
     await hub.connect(socket)
     try:
         while True:
@@ -532,7 +609,7 @@ async def diagnostic_stream(request: DiagnosticRequest) -> AsyncGenerator[str, N
 
 
 @app.post("/api/diagnostics/stream", tags=["diagnostics"])
-async def stream_diagnostic(request: DiagnosticRequest) -> StreamingResponse:
+async def stream_diagnostic(request: DiagnosticRequest, _: OperatorUp) -> StreamingResponse:
     """Stream intermediate specialist events for the reasoning console."""
 
     return StreamingResponse(diagnostic_stream(request), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -551,7 +628,7 @@ class NotificationReviewRequest(BaseModel):
 
 
 @app.get("/api/agent/activity", tags=["agent"])
-async def list_agent_activity(limit: int = Query(default=100, ge=1, le=500), machine_id: str | None = Query(default=None)) -> dict[str, object]:
+async def list_agent_activity(_: CurrentUser, limit: int = Query(default=100, ge=1, le=500), machine_id: str | None = Query(default=None)) -> dict[str, object]:
     """Return the Agent activity log so the human can audit what the Agent did."""
 
     database = get_database()
@@ -566,7 +643,7 @@ async def list_agent_activity(limit: int = Query(default=100, ge=1, le=500), mac
 
 
 @app.get("/api/agent/activity/realtime", tags=["agent"])
-async def list_recent_activity(limit: int = Query(default=30, ge=1, le=200)) -> dict[str, object]:
+async def list_recent_activity(_: CurrentUser, limit: int = Query(default=30, ge=1, le=200)) -> dict[str, object]:
     """Return the in-memory recent activity (fast path, no DB read)."""
 
     bus: ActivityBus = app.state.activity_bus
@@ -574,14 +651,14 @@ async def list_recent_activity(limit: int = Query(default=30, ge=1, le=200)) -> 
 
 
 @app.post("/api/agent/scan", tags=["agent"])
-async def trigger_scan() -> dict[str, object]:
+async def trigger_scan(_: OperatorUp) -> dict[str, object]:
     """Force the autonomous loop to scan immediately."""
 
     return await app.state.autonomous_loop.trigger_scan()
 
 
 @app.post("/api/agent/loop/toggle", tags=["agent"])
-async def toggle_loop(enable: bool | None = Query(default=None)) -> dict[str, object]:
+async def toggle_loop(_: AdminOnly, enable: bool | None = Query(default=None)) -> dict[str, object]:
     """开启或关闭自主监控循环。不传参数则切换当前状态。"""
 
     loop = app.state.autonomous_loop
@@ -599,7 +676,7 @@ async def toggle_loop(enable: bool | None = Query(default=None)) -> dict[str, ob
 
 
 @app.get("/api/agent/loop/status", tags=["agent"])
-async def loop_status() -> dict[str, object]:
+async def loop_status(_: CurrentUser) -> dict[str, object]:
     """查询自主循环当前状态。"""
 
     return {"loop_running": app.state.autonomous_loop.is_running(), "loop_enabled": getattr(app.state, "loop_enabled", False), "last_scan_at": app.state.autonomous_loop.last_scan_at, "last_summary": app.state.autonomous_loop.last_summary}
@@ -607,8 +684,10 @@ async def loop_status() -> dict[str, object]:
 
 @app.websocket("/ws/agent")
 async def agent_activity_stream(socket: WebSocket) -> None:
-    """Push every Agent activity event in real time (used by the Agent monitor page)."""
+    """Push every Agent activity event in real time (used by the Agent monitor page; token 走 ?token=)。"""
 
+    if await authenticate_websocket(socket) is None:
+        return
     await socket.accept()
     bus: ActivityBus = app.state.activity_bus
     queue = bus.subscribe()
@@ -633,14 +712,14 @@ async def agent_activity_stream(socket: WebSocket) -> None:
 
 
 @app.get("/api/notifications", tags=["agent"])
-async def list_notifications(status: str | None = Query(default="pending"), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
+async def list_notifications(_: CurrentUser, status: str | None = Query(default="pending"), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
     """List Agent-issued notifications (default: pending human review)."""
 
     return {"items": get_database().list_notifications(status=status, limit=limit), "count": len(get_database().list_notifications(status=status, limit=limit))}
 
 
 @app.post("/api/notifications/{notification_id}/review", tags=["agent"])
-async def review_notification(notification_id: str, request: NotificationReviewRequest) -> dict[str, object]:
+async def review_notification(notification_id: str, request: NotificationReviewRequest, _: OperatorUp) -> dict[str, object]:
     """Approve or dismiss a pending Agent notification (the human-in-the-loop audit point)."""
 
     database = get_database()
@@ -688,6 +767,7 @@ async def review_notification(notification_id: str, request: NotificationReviewR
 
 @app.get("/api/logs", tags=["observability"])
 async def read_logs(
+    _: CurrentUser,
     limit: int = Query(default=200, ge=1, le=2000),
     level: str | None = Query(default=None, description="INFO / WARNING / ERROR"),
     component: str | None = Query(default=None, description="组件名子串，如 llm / chat / api"),
@@ -702,6 +782,7 @@ async def read_logs(
 
 @app.get("/api/logs/llm", tags=["observability"])
 async def read_llm_audit(
+    _: CurrentUser,
     limit: int = Query(default=200, ge=1, le=2000),
     trace_id: str | None = Query(default=None),
 ) -> dict[str, object]:
@@ -713,6 +794,7 @@ async def read_llm_audit(
 
 @app.get("/api/logs/tools", tags=["observability"])
 async def read_tool_calls(
+    _: CurrentUser,
     limit: int = Query(default=200, ge=1, le=2000),
     trace_id: str | None = Query(default=None),
 ) -> dict[str, object]:
@@ -723,7 +805,7 @@ async def read_tool_calls(
 
 
 @app.get("/api/logs/trace/{trace_id}", tags=["observability"])
-async def read_trace(trace_id: str) -> dict[str, object]:
+async def read_trace(_: CurrentUser, trace_id: str) -> dict[str, object]:
     """Return every log record sharing one trace_id — the full call chain of one request."""
 
     return {
@@ -735,7 +817,7 @@ async def read_trace(trace_id: str) -> dict[str, object]:
 
 
 @app.get("/api/logs/stats", tags=["observability"])
-async def read_log_stats() -> dict[str, object]:
+async def read_log_stats(_: CurrentUser) -> dict[str, object]:
     """Return log file sizes and line counts."""
 
     return log_stats()
@@ -752,7 +834,7 @@ class SkillRunRequest(BaseModel):
 
 
 @app.get("/api/skills", tags=["skills"])
-async def list_skills() -> dict[str, object]:
+async def list_skills(_: CurrentUser) -> dict[str, object]:
     """List every registered skill with metadata, schemas and examples."""
 
     from src.skills import SkillRegistry
@@ -762,7 +844,7 @@ async def list_skills() -> dict[str, object]:
 
 
 @app.get("/api/skills/{skill_id}", tags=["skills"])
-async def skill_detail(skill_id: str) -> dict[str, object]:
+async def skill_detail(_: CurrentUser, skill_id: str) -> dict[str, object]:
     """Return one skill's contract: input/output JSON schema, examples, health."""
 
     from src.skills import SkillRegistry
@@ -777,7 +859,7 @@ async def skill_detail(skill_id: str) -> dict[str, object]:
 
 
 @app.post("/api/skills/{skill_id}/run", tags=["skills"])
-async def run_skill(skill_id: str, request: SkillRunRequest) -> dict[str, object]:
+async def run_skill(skill_id: str, request: SkillRunRequest, _: OperatorUp) -> dict[str, object]:
     """Execute a skill through the registry (audited to tool_calls.jsonl)."""
 
     from src.skills import SkillRegistry
@@ -811,7 +893,7 @@ async def get_chat_agent():
 
 
 @app.post("/api/chat", tags=["chat"])
-async def chat(request: ChatRequest) -> dict[str, object]:
+async def chat(request: ChatRequest, _: CurrentUser) -> dict[str, object]:
     """Answer a query question with deterministic tools + LLM composition."""
 
     agent = await get_chat_agent()
@@ -819,7 +901,7 @@ async def chat(request: ChatRequest) -> dict[str, object]:
 
 
 @app.get("/api/chat/threads", tags=["chat"])
-async def chat_threads(limit: int = Query(default=30, ge=1, le=100)) -> dict[str, object]:
+async def chat_threads(_: CurrentUser, limit: int = Query(default=30, ge=1, le=100)) -> dict[str, object]:
     """List chat threads for the sidebar."""
 
     items = get_database().list_threads(limit)
@@ -827,7 +909,7 @@ async def chat_threads(limit: int = Query(default=30, ge=1, le=100)) -> dict[str
 
 
 @app.get("/api/chat/threads/{thread_id}", tags=["chat"])
-async def chat_thread_messages(thread_id: str) -> dict[str, object]:
+async def chat_thread_messages(_: CurrentUser, thread_id: str) -> dict[str, object]:
     """Return one thread's full transcript."""
 
     thread = get_database().get_thread(thread_id)
@@ -852,6 +934,7 @@ class RememberRequest(BaseModel):
 
 @app.get("/api/memory", tags=["memory"])
 async def list_memory(
+    _: CurrentUser,
     subject: str | None = Query(default=None),
     kind: str | None = Query(default=None),
     query: str | None = Query(default=None),
@@ -866,7 +949,7 @@ async def list_memory(
 
 
 @app.post("/api/memory", tags=["memory"])
-async def write_memory(request: RememberRequest) -> dict[str, object]:
+async def write_memory(request: RememberRequest, _: OperatorUp) -> dict[str, object]:
     """Persist one long-term memory item (deduped by content)."""
 
     from src.memory import MemoryManager
@@ -879,7 +962,7 @@ async def write_memory(request: RememberRequest) -> dict[str, object]:
 
 
 @app.delete("/api/memory/{memory_id}", tags=["memory"])
-async def delete_memory(memory_id: str) -> dict[str, object]:
+async def delete_memory(memory_id: str, _: AdminOnly) -> dict[str, object]:
     """Forget one memory item (user correction path)."""
 
     from src.memory import MemoryManager
@@ -890,7 +973,7 @@ async def delete_memory(memory_id: str) -> dict[str, object]:
 
 
 @app.post("/api/memory/profile/{machine_id}/refresh", tags=["memory"])
-async def refresh_machine_profile(machine_id: str) -> dict[str, object]:
+async def refresh_machine_profile(machine_id: str, _: OperatorUp) -> dict[str, object]:
     """Re-derive a machine's profile facts from diagnostics/maintenance history."""
 
     from src.memory import MemoryManager
@@ -903,7 +986,7 @@ async def refresh_machine_profile(machine_id: str) -> dict[str, object]:
 # ============================================================================
 
 @app.get("/api/reports", tags=["reports"])
-async def list_reports(machine_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
+async def list_reports(_: CurrentUser, machine_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
     """List generated maintenance reports (newest first)."""
 
     items = get_database().list_reports(machine_id, limit)
@@ -911,7 +994,7 @@ async def list_reports(machine_id: str | None = Query(default=None), limit: int 
 
 
 @app.get("/api/reports/{report_id}", tags=["reports"])
-async def report_detail(report_id: str) -> dict[str, object]:
+async def report_detail(_: CurrentUser, report_id: str) -> dict[str, object]:
     """Return one full maintenance report including its markdown body."""
 
     item = get_database().get_report(report_id)
@@ -943,7 +1026,7 @@ def _webhook_payload(channel: str, report: dict[str, object]) -> dict[str, objec
 
 
 @app.post("/api/reports/{report_id}/push", tags=["reports"])
-async def push_report(report_id: str, request: ReportPushRequest) -> dict[str, object]:
+async def push_report(report_id: str, request: ReportPushRequest, _: AdminOnly) -> dict[str, object]:
     """把维护报告推送到企业微信 / 飞书 / 钉钉群机器人。
 
     Webhook 地址优先取请求体，其次读 .env 的 ``REPORT_WEBHOOK_URL``；
@@ -989,7 +1072,7 @@ async def push_report(report_id: str, request: ReportPushRequest) -> dict[str, o
 # ============================================================================
 
 @app.get("/api/data/provenance", tags=["data"])
-async def data_provenance(dataset: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
+async def data_provenance(_: CurrentUser, dataset: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
     """Explain where each dataset came from (lineage records)."""
 
     items = get_database().list_provenance(dataset, limit)
@@ -997,7 +1080,7 @@ async def data_provenance(dataset: str | None = Query(default=None), limit: int 
 
 
 @app.get("/api/data/realtime/status", tags=["data"])
-async def realtime_status() -> dict[str, object]:
+async def realtime_status(_: CurrentUser) -> dict[str, object]:
     """Expose the realtime engine state (running, step, ticks)."""
 
     engine = getattr(app.state, "realtime", None)
@@ -1006,8 +1089,8 @@ async def realtime_status() -> dict[str, object]:
 
 
 @app.post("/api/data/realtime/tick", tags=["data"])
-async def realtime_tick_manual() -> dict[str, object]:
-    """Manually advance the simulator by one step (demo/debug path)."""
+async def realtime_tick_manual(_: AdminOnly) -> dict[str, object]:
+    """Manually advance the simulator by one step (demo/debug path, 仅管理员)。"""
 
     from src.data import RealtimeEngine
     engine = RealtimeEngine(get_database(), tick_seconds=10**6)
