@@ -209,7 +209,7 @@ export function ReportsPage(): JSX.Element {
       {reports.length === 0 && <Empty label="暂无报告。在 Agent 监控页批准一条高风险通知后，系统会自动生成。" />}
       {reports.map((item) => <button key={item.id} className={`asset-row ${detail?.id === item.id ? "selected" : ""}`} onClick={() => void openReport(item.id)}>
         <span className="status-dot critical" />
-        <div><strong>{item.machine_id} 维护报告</strong><small>{item.summary.slice(0, 42)}…</small></div>
+        <div><strong>{item.machine_id} 维护报告</strong><small>{item.summary}</small></div>
         <em>{new Date(item.generated_at).toLocaleDateString("zh-CN")}</em>
       </button>)}
     </section>

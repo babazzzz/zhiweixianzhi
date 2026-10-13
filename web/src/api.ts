@@ -2,6 +2,11 @@ import type { AgentActivity, AgentActivityResponse, CaseItem, ChatStoredMessage,
 
 const baseUrl = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 
+/** WebSocket 基址：由 API 基址派生（http→ws / https→wss），避免硬编码。 */
+export function wsBase(): string {
+  return baseUrl.replace(/^http/, "ws");
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) } });
   if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);

@@ -208,6 +208,7 @@ export function KnowledgePage(): JSX.Element {
   const [rules, setRules] = useState<Rule[]>([]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<{ fmeca: Rule[]; cases: CaseItem[]; chunks: HybridChunk[] } | null>(null);
+  const [expandedChunk, setExpandedChunk] = useState<string | null>(null);
   useEffect(() => { void api.fmeca().then(setRules).catch(() => setRules([])); }, []);
   const search = async (): Promise<void> => {
     if (!query.trim()) return;
@@ -225,11 +226,17 @@ export function KnowledgePage(): JSX.Element {
     </section>
     {results && results.chunks.length > 0 && <section className="panel">
       <PanelTitle title={`混合检索结果 (${results.chunks.length})`} />
-      <div className="chunk-list">{results.chunks.map((chunk) => <article key={chunk.id} className="chunk-item">
-        <header><span className="tag">{chunk.doc_type}</span><strong>{chunk.section?.join(" › ") ?? chunk.source}</strong><em>RRF {chunk.score.toFixed(4)}</em></header>
-        <p>{chunk.text.slice(0, 220)}…</p>
-        <small>BM25 排名 {chunk.bm25_rank ?? "—"} · 向量排名 {chunk.dense_rank ?? "—"}</small>
-      </article>)}</div>
+      <div className="chunk-list">{results.chunks.map((chunk) => {
+        const expanded = expandedChunk === chunk.id;
+        return <article key={chunk.id} className="chunk-item">
+          <header><span className="tag">{chunk.doc_type}</span><strong>{chunk.section?.join(" › ") ?? chunk.source}</strong><em>RRF {chunk.score.toFixed(4)}</em></header>
+          <p>{expanded || chunk.text.length <= 220 ? chunk.text : `${chunk.text.slice(0, 220)}…`}</p>
+          {chunk.text.length > 220 && <button className="text-button expand-toggle" onClick={() => setExpandedChunk(expanded ? null : chunk.id)}>
+            {expanded ? "收起" : `展开全文（共 ${chunk.text.length} 字）`}
+          </button>}
+          <small>BM25 排名 {chunk.bm25_rank ?? "—"} · 向量排名 {chunk.dense_rank ?? "—"}</small>
+        </article>;
+      })}</div>
     </section>}
     {results && <div className="two-column">
       <section className="panel"><PanelTitle title="匹配 FMECA 规则" />{results.fmeca.length ? <RulesTable rules={results.fmeca} /> : <Empty label="没有命中结构化规则。" />}</section>

@@ -5,7 +5,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../api";
+import { api, wsBase } from "../api";
 import { AgentTimeline, DecisionPanel, DiagnosticsList, Empty, EvidenceChain, Metric, PanelTitle, RiskBadge } from "../components/ui";
 import type { AgentActivity, Diagnostic, DiagnosticPayload, Machine, Notification } from "../types";
 
@@ -85,8 +85,9 @@ export function AgentMonitorPage(): JSX.Element {
   useEffect(() => { const id = setInterval(() => void refresh(), 8000); return () => clearInterval(id); }, [refresh]);
 
   useEffect(() => {
-    const wsBase = (import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000").replace(/^http/, "ws");
-    const socket = new WebSocket(`${wsBase}/ws/agent`);
+    // WS 地址随 VITE_API_BASE 派生；登录态就绪后附带 token（B4）
+    const token = localStorage.getItem("zhiwei_token");
+    const socket = new WebSocket(`${wsBase()}/ws/agent${token ? `?token=${encodeURIComponent(token)}` : ""}`);
     socket.onopen = () => setBusConnected(true);
     socket.onclose = () => setBusConnected(false);
     socket.onerror = () => setBusConnected(false);

@@ -1,9 +1,10 @@
 /** 通用 UI 原子组件（shadcn 风格：中性色 / 1px 边框 / radius 10px）。 */
 
+import type { ReactNode } from "react";
 import type { AgentEvent, CaseItem, Decision, Diagnostic, Evidence, Rule, WorkOrder } from "../types";
 
-export function Metric({ label, value, note, tone = "default" }: { label: string; value: string; note: string; tone?: "default" | "normal" | "warning" | "critical" }): JSX.Element {
-  return <article className={`metric-card ${tone}`}><span>{label}</span><strong>{value}</strong><small>{note}</small></article>;
+export function Metric({ label, value, note, tone = "default", chart }: { label: string; value: string; note: string; tone?: "default" | "normal" | "warning" | "critical"; chart?: ReactNode }): JSX.Element {
+  return <article className={`metric-card ${tone}`}><span>{label}</span><strong>{value}</strong><small>{note}</small>{chart}</article>;
 }
 
 export function PanelTitle({ title, action, onAction }: { title: string; action?: string; onAction?: () => void }): JSX.Element {

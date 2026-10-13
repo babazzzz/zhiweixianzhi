@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TrendChart } from "../TrendChart";
+import { MiniBar, Sparkline } from "../components/charts";
 import { DiagnosticsList, Empty, HealthBar, Loading, Metric, OrdersList, PanelTitle, RiskBadge } from "../components/ui";
 import type { Diagnostic, DiagnosticPayload, Machine, Overview, WorkOrder } from "../types";
 
@@ -48,14 +49,35 @@ export function OverviewPage({ overview, machines, onNavigate }: { overview: Ove
     return { name, total: members.length, risky: members.filter(isRisky).length, average };
   });
   const scoped = sorted.filter((machine) => (line === "all" || machine.production_line === line) && (!onlyRisk || isRisky(machine)));
+  // 全厂健康度分布（真实读数分桶）：严重 <40% / 临界 40–55% / 警告 55–75% / 良好 75–90% / 优 ≥90%
+  const healthBuckets = [0, 0, 0, 0, 0];
+  for (const machine of machines) {
+    const score = machine.live_health_score;
+    if (score === null || score === undefined) continue;
+    if (score < 0.4) healthBuckets[0] += 1;
+    else if (score < 0.55) healthBuckets[1] += 1;
+    else if (score < 0.75) healthBuckets[2] += 1;
+    else if (score < 0.9) healthBuckets[3] += 1;
+    else healthBuckets[4] += 1;
+  }
+  const noScoreCount = machines.length - healthBuckets.reduce((sum, item) => sum + item, 0);
 
   return <>
     <div className="metric-grid">
       <Metric label="在线设备" value={`${fleet.total - fleet.offline} / ${fleet.total}`} note="已纳入监测链路" />
-      <Metric label="平均健康度" value={`${(fleet.average_health * 100).toFixed(1)}%`} note="动态基线计算" tone={fleet.average_health < 0.65 ? "warning" : "normal"} />
-      <Metric label="高风险设备" value={String(fleet.critical)} note="需优先评审" tone="critical" />
+      <Metric label="平均健康度" value={`${(fleet.average_health * 100).toFixed(1)}%`} note="各产线均值"
+        tone={fleet.average_health < 0.65 ? "warning" : "normal"}
+        chart={<Sparkline data={lineStats.map((item) => Number((item.average * 100).toFixed(1)))} label="各产线平均健康度" />} />
+      <Metric label="高风险设备" value={String(fleet.critical)} note="各产线分布" tone="critical"
+        chart={<MiniBar data={lineStats.map((item) => item.risky)} label="各产线高风险设备数" />} />
       <Metric label="未处置告警" value={String(fleet.warning + fleet.critical)} note="来自实时异常检测" tone="warning" />
     </div>
+
+    <section className="panel distribution-panel">
+      <PanelTitle title="全厂健康度分布" />
+      <MiniBar className="chart-tall" data={healthBuckets} label="全厂健康度分布直方图" />
+      <p className="muted">按实时健康度分桶：严重 &lt;40% · 临界 40–55% · 警告 55–75% · 良好 75–90% · 优 ≥90%；{healthBuckets.reduce((sum, item) => sum + item, 0)} 台有实时读数{noScoreCount > 0 ? `，${noScoreCount} 台暂无` : ""}。</p>
+    </section>
 
     <section className="panel matrix-panel">
       <div className="panel-title">
