@@ -126,11 +126,11 @@ Vite 固定监听 `http://127.0.0.1:5173`（见 `web/vite.config.ts`）。首次
 # 构建 BM25 + 稠密索引（稠密部分需要本地 Ollama 提供 bge-m3）
 .venv\Scripts\python.exe scripts/rag_tools.py build
 
-# 评估检索效果（12 条查询的 recall@5，当前 11/12）
+# 评估检索效果（15 条查询的 recall@5，当前 15/15）
 .venv\Scripts\python.exe scripts/rag_tools.py eval
 ```
 
-首次提问或首次调用知识检索时，系统也会自动构建索引（`KnowledgeIndex.ensure()`），因此这一步不是必须的。索引落在 `data/index/`（`bm25.pkl` + `chunks.json` + `fingerprint.json`）。
+首次提问或首次调用知识检索时，系统也会自动构建索引（`KnowledgeIndex.ensure()`），因此这一步不是必须的。索引落在 `data/index/`（`bm25.pkl` + `chunks.json` + `fingerprint.json`）。**稠密通道依赖本地 Ollama 提供 bge-m3**：Ollama 未启动时嵌入调用失败，检索自动退化为纯 BM25，源文档的改动也不会写进向量库——改过 `data/knowledge/` 下的文档后，请确认 Ollama 在运行再执行 `build`。
 
 ### 3.6 访问地址
 
@@ -312,7 +312,7 @@ classify ─▶ dispatch ─▶ compose ─▶ END
 | `data/` | 数据链路 | `workload.py`（工况调制）· `realtime.py`（实时推进引擎） |
 | `database/` | 仓储层 | `connection.py`（14 张表 DDL + 查询，含 `users` 表与账号 CRUD）· `schemas.py` · `init_db.py`（FMECA 9 条 / 案例 4 条）· `regenerate.py`（**全量重建**） |
 | `graph/` | 图定义 | `main_graph.py`（**主诊断图**）· `edges.py` · `build.py`（教学版 8 节点图） |
-| `knowledge/` | 知识层 | `fault_graph.py`（因果图 14 节点）· `chunking.py`（结构感知分块）· `retrieval.py`（BM25 + 稠密 + RRF）· `index_builder.py`（108 chunk 索引） |
+| `knowledge/` | 知识层 | `fault_graph.py`（因果图 14 节点）· `chunking.py`（结构感知分块）· `retrieval.py`（BM25 + 稠密 + RRF）· `index_builder.py`（136 chunk 索引） |
 | `llm/` | LLM 客户端 | `client.py`（`UnifiedLLMClient`：chat / embed / health_check / parse_json） |
 | `memory/` | 记忆 | `manager.py`（`MemoryManager` 门面） |
 | `observability/` | 可观测性 | `logger.py`（3 份日志 + trace 传播 + 读取 API） |
@@ -530,7 +530,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/data/r
 | 5 | **单机 SQLite，非分布式** | 存储是单文件库 + 本地 pickle / Chroma 目录，自治循环与实时引擎都是进程内协程；不支持多实例水平扩展 |
 | 6 | **历史库不含工况节律** | 工况调制只在 `RealtimeEngine`（默认关）生效，`data/zhiwei.db` 里的 67202 条读数是「恒定负荷下的退化曲线」，看不到夜班降载、换刀窗口、周三保养等现象 |
 | 7 | **`health` 缺失 ≠ 设备离线** | 健康分缺失时按中性基线 `0.8` 处理（视为在运行）；「离线」只由读数新鲜度决定（落后全厂最新 > 120 分钟）。判断数据是否新鲜应看 `latest_reading.timestamp` |
-| 8 | **RAG 知识源仅 4 类文档 + 3 张表** | 索引共 108 个 chunk；`recall@5 = 0.917`（11/12）是对 **12 条预置查询**的评测结果，唯一未命中的是知识库未覆盖的业务指标类问题，不代表开放域问答能力 |
+| 8 | **RAG 知识源仅 5 类文档 + 3 张表** | 索引共 136 个 chunk；`recall@5 = 1.0`（15/15）是对 **15 条预置查询**的评测结果，知识库覆盖面受这 5 份人工文档的边界限制，不代表开放域问答能力 |
 | 9 | **自主循环与实时引擎默认关** | 默认启动态是「静态数据 + 手动触发」；「数据在往前走」与「无人值守自动派单」需要显式开启环境变量或调用运行时开关 |
 | 10 | **实时 tick 追加的读数不带健康分** | `RealtimeEngine` 追加读数的 `health_score` 为空（仿真器输出不含该字段），健康分按中性 `0.8` 处理；实时引擎默认关闭，手动 tick 为演示路径，正式演示前建议以 `verify_diagnosis_accuracy.py` 复核 |
 
