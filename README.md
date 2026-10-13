@@ -67,7 +67,7 @@
 | 数值 | NumPy · Pandas · SciPy · scikit-learn |
 | 前端 | React 18 · TypeScript 5 · Vite 5 · Tailwind CSS 3 · **echarts 5** · lucide-react 图标 |
 | LLM（可选） | Ollama 本地 `qwen2.5:7b`（monitor / knowledge / reflection / chat）+ `bge-m3`（嵌入）；DeepSeek 云端 `deepseek-chat`（diagnostic / prediction / decision / report） |
-| 测试 | pytest（**44 项**，约 2.3 s，8 个文件） |
+| 测试 | pytest（**44 项**，约 4 s，7 个测试文件 + `conftest.py`） |
 
 ---
 
@@ -86,6 +86,22 @@ python -m venv .venv
 # 3) 复制环境变量模板（不含任何密钥）
 copy .env.example .env
 ```
+
+**4) 启动本地 Ollama（可选，但稠密检索依赖它）**
+
+```bash
+# 保持常驻，默认监听 127.0.0.1:11434
+ollama serve
+
+# 嵌入模型：稠密检索通道必需，缺失时 RAG 自动退化为纯 BM25
+ollama pull bge-m3
+
+# 本地对话模型：monitor / knowledge / reflection / chat 四个节点的本地通道
+# （不装则这些节点走 DeepSeek 云端；DeepSeek 未配置时相关节点降级为确定性模板）
+ollama pull qwen2.5:7b
+```
+
+启动后可用 `curl http://127.0.0.1:11434/api/tags` 确认模型已就位；后端 `/health` 的 `llm.ollama` 与 `rag.dense_enabled` 也会反映其可用性。模型名与地址在 `.env` 的 `OLLAMA_*` 配置项中调整。
 
 ### 3.2 生成数据库（首次 clone 必须执行）
 
