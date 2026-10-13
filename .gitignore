@@ -61,6 +61,10 @@ error_screenshot.png
 # 构建缓存
 *.tsbuildinfo
 
+# Vite 从 tailwind.config.ts 自动生成的转译产物（勿跟踪）
+web/tailwind.config.js
+web/tailwind.config.d.ts
+
 # 课程/个人文档（含姓名学号等隐私，不入库）
 *.docx
 *.html
