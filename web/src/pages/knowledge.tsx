@@ -246,7 +246,7 @@ export function KnowledgePage(): JSX.Element {
   </>;
 }
 
-export function OperationsPage({ machines }: { machines: Array<{ id: string }> }): JSX.Element {
+export function OperationsPage({ machines, canWrite = true }: { machines: Array<{ id: string }>; canWrite?: boolean }): JSX.Element {
   const [orders, setOrders] = useState<Array<{ id: string; machine_id: string; maintenance_type: string; technician: string; status: string; start_time: string }>>([]);
   const [machineId, setMachineId] = useState(machines[0]?.id ?? "CNC_001");
   const [message, setMessage] = useState("");
@@ -261,7 +261,7 @@ export function OperationsPage({ machines }: { machines: Array<{ id: string }> }
         <p className="muted">Agent 只给出建议；维护执行需要由工程师确认后创建工单。</p></div>
       <div className="launch-controls">
         <select value={machineId} onChange={(event) => setMachineId(event.target.value)}>{machines.map((machine) => <option key={machine.id} value={machine.id}>{machine.id}</option>)}</select>
-        <button className="button primary" onClick={() => void create()}>新建工单</button>
+        <button className="button primary" disabled={!canWrite} title={canWrite ? "" : "需要操作员或管理员权限"} onClick={() => void create()}>新建工单</button>
       </div>
     </section>
     {message && <div className="notice-banner">{message}</div>}

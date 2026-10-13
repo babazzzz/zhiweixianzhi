@@ -5,11 +5,14 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { api, wsBase } from "../api";
+import { api, currentToken, wsBase } from "../api";
 import { AgentTimeline, DecisionPanel, DiagnosticsList, Empty, EvidenceChain, Metric, PanelTitle, RiskBadge } from "../components/ui";
 import type { AgentActivity, Diagnostic, DiagnosticPayload, Machine, Notification } from "../types";
 
-export function DiagnosticsPage({ machines }: { machines: Machine[] }): JSX.Element {
+/** 无写权限时的统一提示（与后端 OperatorUp 对应）。 */
+const writeDenied = "需要操作员或管理员权限";
+
+export function DiagnosticsPage({ machines, canWrite = true }: { machines: Machine[]; canWrite?: boolean }): JSX.Element {
   const [machineId, setMachineId] = useState<string>(machines[0]?.id ?? "CNC_001");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<(DiagnosticPayload & { id: string; thread_id: string }) | null>(null);
@@ -29,7 +32,7 @@ export function DiagnosticsPage({ machines }: { machines: Machine[] }): JSX.Elem
         <p className="muted">所有诊断必须经过 Monitor、E1–E7、RUL 区间、决策与 5 项 Reflection。</p></div>
       <div className="launch-controls">
         <select value={machineId} onChange={(event) => setMachineId(event.target.value)}>{machines.map((machine) => <option key={machine.id} value={machine.id}>{machine.id} · {machine.production_line}</option>)}</select>
-        <button className="button primary" disabled={running || !machineId} onClick={() => void trigger()}>{running ? "正在编排…" : "触发诊断"}</button>
+        <button className="button primary" disabled={running || !machineId || !canWrite} title={canWrite ? "" : writeDenied} onClick={() => void trigger()}>{running ? "正在编排…" : "触发诊断"}</button>
       </div>
     </section>
     {error && <div className="error-banner">{error}</div>}
@@ -58,7 +61,7 @@ export function DiagnosticResult({ payload }: { payload: DiagnosticPayload & { i
   </>;
 }
 
-export function AgentMonitorPage(): JSX.Element {
+export function AgentMonitorPage({ canWrite = true }: { canWrite?: boolean }): JSX.Element {
   const [activities, setActivities] = useState<AgentActivity[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [loopRunning, setLoopRunning] = useState(false);
@@ -85,8 +88,8 @@ export function AgentMonitorPage(): JSX.Element {
   useEffect(() => { const id = setInterval(() => void refresh(), 8000); return () => clearInterval(id); }, [refresh]);
 
   useEffect(() => {
-    // WS 地址随 VITE_API_BASE 派生；登录态就绪后附带 token（B4）
-    const token = localStorage.getItem("zhiwei_token");
+    // WS 地址随 VITE_API_BASE 派生；token 走 ?token=（浏览器无法给 WS 设请求头）
+    const token = currentToken();
     const socket = new WebSocket(`${wsBase()}/ws/agent${token ? `?token=${encodeURIComponent(token)}` : ""}`);
     socket.onopen = () => setBusConnected(true);
     socket.onclose = () => setBusConnected(false);
@@ -150,7 +153,7 @@ export function AgentMonitorPage(): JSX.Element {
         <div className="agent-status-actions">
           <span className={`loop-pill ${loopRunning ? "running" : "stopped"}`}><span className="loop-dot" />{loopRunning ? "循环运行中" : "循环已停止"}</span>
           <span className={`bus-pill ${busConnected ? "connected" : "disconnected"}`}><span className="bus-dot" />实时通道 {busConnected ? "已连接" : "已断开"}</span>
-          <button className="button primary" onClick={() => void forceScan()}>立即扫描一次</button>
+          <button className="button primary" disabled={!canWrite} title={canWrite ? "" : writeDenied} onClick={() => void forceScan()}>立即扫描一次</button>
         </div>
       </div>
       {scanMessage && <div className="notice-banner">{scanMessage}</div>}
@@ -208,8 +211,8 @@ export function AgentMonitorPage(): JSX.Element {
             <p>{item.message}</p>
             <p className="notification-machine">{item.machine_id && <RiskBadge severity={item.severity} />} {item.machine_id ?? ""}</p>
             <div className="notification-actions">
-              <button className="button primary" onClick={() => void review(item, "approve")}>批准并生成报告</button>
-              <button className="button ghost" onClick={() => void review(item, "dismiss")}>驳回</button>
+              <button className="button primary" disabled={!canWrite} title={canWrite ? "" : writeDenied} onClick={() => void review(item, "approve")}>批准并生成报告</button>
+              <button className="button ghost" disabled={!canWrite} title={canWrite ? "" : writeDenied} onClick={() => void review(item, "dismiss")}>驳回</button>
             </div>
           </article>
         ))}

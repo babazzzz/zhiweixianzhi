@@ -2,22 +2,24 @@
  *
  * 页面实现拆分在 `pages/`（fleet / agents / knowledge / chat），
  * 通用原子组件在 `components/ui.tsx`——本文件只负责导航与全局数据流。
- * 主题（浅色/暗色）见 theme.ts；登录态接入见 B4（auth.tsx）。
+ * 主题（浅色/暗色）见 theme.ts；登录态与角色门控见 auth.tsx。
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { Component } from "react";
 import type { ReactNode } from "react";
 import {
-  Activity, BookOpen, Bot, ClipboardList, Cpu, FileText, Gauge, LayoutDashboard, MessageSquare,
+  Activity, BookOpen, Bot, ClipboardList, Cpu, FileText, Gauge, LayoutDashboard, LogOut, MessageSquare,
   Moon, RefreshCw, Network, ScrollText, Sun, Stethoscope
 } from "lucide-react";
-import { api, wsBase } from "./api";
+import { api, currentToken, wsBase } from "./api";
+import { AuthProvider, useAuth } from "./auth";
 import { getTheme, toggleTheme } from "./theme";
 import { AgentMonitorPage, DiagnosticsPage } from "./pages/agents";
 import { ChatPage, LogsPage, ReportsPage } from "./pages/chat";
 import { MachinesPage, OverviewPage } from "./pages/fleet";
 import { KnowledgePage, OperationsPage, TopologyPage } from "./pages/knowledge";
+import { LoginPage } from "./pages/login";
 import type { Machine, Overview } from "./types";
 
 type Page = "overview" | "machines" | "diagnostics" | "agents" | "chat" | "logs" | "reports" | "topology" | "knowledge" | "operations";
@@ -57,7 +59,10 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
   }
 }
 
-function App(): JSX.Element {
+const roleLabels: Record<string, string> = { admin: "管理员", operator: "操作员", viewer: "观察员" };
+
+function AppShell(): JSX.Element {
+  const { user, ready, logout, canWrite, canAdmin } = useAuth();
   const [page, setPage] = useState<Page>("overview");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [machines, setMachines] = useState<Machine[]>([]);
@@ -75,8 +80,8 @@ function App(): JSX.Element {
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
-    // WS 地址随 VITE_API_BASE 派生；登录态就绪后附带 token（B4）
-    const token = localStorage.getItem("zhiwei_token");
+    // WS 地址随 VITE_API_BASE 派生；登录态就绪后附带 token（?token=，浏览器无法给 WS 带头）
+    const token = currentToken();
     const socket = new WebSocket(`${wsBase()}/ws/realtime${token ? `?token=${encodeURIComponent(token)}` : ""}`);
     socket.onopen = () => socket.send(JSON.stringify({ action: "snapshot" }));
     socket.onmessage = () => { void refresh(); };
@@ -90,6 +95,14 @@ function App(): JSX.Element {
   }, []);
 
   const active = navigation.find((item) => item.id === page);
+
+  // 登录守卫：验活中显示过渡态；未登录渲染登录页（主界面完全不挂载，WS/轮询自然停止）
+  if (!ready) {
+    return <div className="login-page"><p className="muted">正在验证登录状态…</p></div>;
+  }
+  if (!user) {
+    return <LoginPage />;
+  }
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -108,6 +121,11 @@ function App(): JSX.Element {
         <div><p className="eyebrow">CNC Predictive Maintenance</p><h1>{active?.label}</h1></div>
         <div className="top-actions">
           <span className="updated"><Activity size={11} style={{ verticalAlign: "-1px", marginRight: 4 }} />{updatedAt ? `更新于 ${updatedAt.toLocaleTimeString("zh-CN")}` : "正在连接"}</span>
+          <span className="user-chip" title={`${user.username} · ${user.role}`}>
+            {user.display_name ?? user.username}
+            <em className="role-badge">{roleLabels[user.role] ?? user.role}</em>
+            <button className="logout" title="退出登录" onClick={logout}><LogOut size={13} /></button>
+          </span>
           <button className="theme-toggle" title={dark ? "切换到浅色" : "切换到暗色"} onClick={() => setDark(toggleTheme() === "dark")}>
             {dark ? <Sun size={15} /> : <Moon size={15} />}
           </button>
@@ -119,18 +137,20 @@ function App(): JSX.Element {
         <ErrorBoundary key={page}>
           {page === "overview" && <OverviewPage overview={overview} machines={machines} onNavigate={setPage} />}
           {page === "machines" && <MachinesPage machines={machines} />}
-          {page === "diagnostics" && <DiagnosticsPage machines={machines} />}
-          {page === "agents" && <AgentMonitorPage />}
+          {page === "diagnostics" && <DiagnosticsPage machines={machines} canWrite={canWrite} />}
+          {page === "agents" && <AgentMonitorPage canWrite={canWrite} />}
           {page === "chat" && <ChatPage />}
           {page === "logs" && <LogsPage />}
-          {page === "reports" && <ReportsPage />}
+          {page === "reports" && <ReportsPage canAdmin={canAdmin} />}
           {page === "topology" && <TopologyPage />}
           {page === "knowledge" && <KnowledgePage />}
-          {page === "operations" && <OperationsPage machines={machines} />}
+          {page === "operations" && <OperationsPage machines={machines} canWrite={canWrite} />}
         </ErrorBoundary>
       </section>
     </main>
   </div>;
 }
 
-export default App;
+export default function App(): JSX.Element {
+  return <AuthProvider><AppShell /></AuthProvider>;
+}

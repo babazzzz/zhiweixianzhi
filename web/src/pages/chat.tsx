@@ -167,7 +167,7 @@ export function LogsPage(): JSX.Element {
   </div>;
 }
 
-export function ReportsPage(): JSX.Element {
+export function ReportsPage({ canAdmin = true }: { canAdmin?: boolean }): JSX.Element {
   const [reports, setReports] = useState<ReportSummaryLite[]>([]);
   const [detail, setDetail] = useState<ReportDetail | null>(null);
   const [error, setError] = useState("");
@@ -232,7 +232,7 @@ export function ReportsPage(): JSX.Element {
               </select>
               <input value={webhook} placeholder="群机器人 Webhook（留空用 .env 配置）"
                 onChange={(event) => setWebhook(event.target.value)} />
-              <button className="button primary" disabled={pushing} onClick={() => void push()}>{pushing ? "推送中…" : "推送到群"}</button>
+              <button className="button primary" disabled={pushing || !canAdmin} title={canAdmin ? "" : "需要管理员权限"} onClick={() => void push()}>{pushing ? "推送中…" : "推送到群"}</button>
             </div>
           </div>
           <article className="report-body">

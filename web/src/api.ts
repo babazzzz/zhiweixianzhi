@@ -1,14 +1,33 @@
 import type { AgentActivity, AgentActivityResponse, CaseItem, ChatStoredMessage, ChatThread, ChatTurn, Diagnostic, DiagnosticPayload, LogItem, Machine, MemoryItem, Notification, Overview, Reading, ReportDetail, ReportSummary, Rule, SkillMetaDef, Topology, WorkOrder } from "./types";
 
-const baseUrl = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+/** API 基址：auth.tsx 的登录/验活复用同一来源，避免两处硬编码。 */
+export const apiBase = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+
+const baseUrl = apiBase;
+const TOKEN_KEY = "zhiwei_token";
+const USER_KEY = "zhiwei_user";
 
 /** WebSocket 基址：由 API 基址派生（http→ws / https→wss），避免硬编码。 */
 export function wsBase(): string {
   return baseUrl.replace(/^http/, "ws");
 }
 
+/** 当前 JWT（登录后由 auth.tsx 写入 localStorage）。 */
+export function currentToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) } });
+  const token = currentToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...(init?.headers as Record<string, string> ?? {}) };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
+  // 401 = token 缺失 / 过期 / 角色不足的读路径：清理并广播，AuthProvider 负责跳登录页
+  if (response.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    window.dispatchEvent(new Event("zhiwei:unauthorized"));
+  }
   if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
   return response.json() as Promise<T>;
 }
