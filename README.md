@@ -1,1027 +1,585 @@
-# 智维先知 — LangGraph 多智能体预测性维护系统
+# 智维先知
 
-> 基于 LangGraph 的 CNC 设备预测性维护系统，从 Coze 竞赛 Demo 迁移为企业级 Agent 架构
+> 基于 **LangGraph** 的 CNC 设备预测性维护系统：把「设备健康监控 → 故障诊断 → 剩余寿命预测 → 维护决策 → 报告生成 → 质量自检 → 自然语言问答」串成一个可无人值守运行的闭环。
+> 后端 FastAPI + SQLite，前端 React 18，数据由确定性物理仿真器驱动。
+
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009485?logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1C3C3C)
+![Tests](https://img.shields.io/badge/tests-44%20passed-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
 ## 目录
 
-- [1. 项目全貌：两套系统](#1-项目全貌两套系统)
-- [2. 快速启动](#2-快速启动)
-- [3. 已知问题修复记录](#3-已知问题修复记录)
-- [4. 数据层详解：数据从哪来有多少仿真器是什么](#4-数据层详解)
-- [5. 文件结构全景图](#5-文件结构全景图)
-- [6. 每个文件做什么怎么做](#6-每个文件做什么怎么做)
-- [7. 系统A：CLI 教学版详解](#7-系统acli-教学版详解)
-- [8. 系统B：企业级 API 版详解](#8-系统b企业级-api-版详解)
-- [9. 调优指南](#9-调优指南)
-- [10. 文档导航](#10-文档导航)
+| 章 | 内容 |
+| --- | --- |
+| 1 | [这是什么 / 解决什么问题](#1-这是什么--解决什么问题) |
+| 2 | [技术栈速览](#2-技术栈速览) |
+| 3 | [快速启动](#3-快速启动) |
+| 4 | [架构概览](#4-架构概览) |
+| 5 | [数据从哪来](#5-数据从哪来) |
+| 6 | [目录结构导览](#6-目录结构导览) |
+| 7 | [接口与前端速览](#7-接口与前端速览) |
+| 8 | [常用配置速查](#8-常用配置速查) |
+| 9 | [系统边界与客观局限](#9-系统边界与客观局限) |
+| 10 | [文档导航](#10-文档导航) |
 
 ---
 
-## 1. 项目全貌：两套系统
+## 1. 这是什么 / 解决什么问题
 
-这个项目包含**两套完全独立的系统**，共用同一个代码仓库但走不同的执行路径：
+**智维先知**是一个面向 CNC 数控加工中心的设备预测性维护系统。它持续读取设备遥测，在设备**尚未损坏时**判断它的健康状态、定位可能的故障类型、估算还能用多久，并给出「现在修还是再等等」的成本对比，最后把结论整理成一份可追溯的报告。
 
-| 维度 | 系统A — CLI 教学版 | 系统B — 企业级 API 版 |
-|------|------|------|
-| **入口** | `python src/main.py` | `python -m uvicorn backend.app:app` |
-| **图引擎** | `src/graph/build.py` | `src/graph/main_graph.py` |
-| **节点数** | 8 个 | 7 个 |
-| **流程** | supervisor → data_pipeline → analysis → diagnosis → decision → self_check → rag → report | monitor → diagnostic → knowledge → prediction → decision → report → reflection |
-| **数据源** | CSV 文件 `data/raw/MACHINE_LOG_DATA._2025.csv`（2999 条，5 维传感器） | SQLite `data/zhiwei.db`（67200 条，22 维传感器） |
-| **状态定义** | `src/state.py` (AgentState) | `src/agents/state.py` (DiagnosticState) |
-| **Agent 文件** | `src/agents/supervisor.py`, `analysis.py`, `diagnosis.py`, `decision.py`, `self_check.py`, `rag.py` | `src/agents/monitor_agent.py`, `diagnostic_agent.py`, `knowledge_agent.py`, `prediction_agent.py`, `decision_agent.py`, `report_agent.py`, `reflection_agent.py` |
-| **特征工程** | `src/tools/feature_engineering.py`（22 维统计+频域特征） | `src/skills/anomaly_detect.py`（三信号融合） |
-| **RUL 算法** | `src/tools/algorithms.py`（威布尔 MLE） | `src/skills/rul_weibull.py`（威布尔+P10/P50/P90） |
-| **知识库** | `src/agents/rag.py`（内嵌 17 条案例+故障模式，关键词匹配） | `src/knowledge/`（FMECA 规则库 + NetworkX 因果图 + ChromaDB 向量库） |
-| **前端** | 无 | React+Vite+Tailwind (`web/` 目录) |
-| **设计目的** | 学习 LangGraph 核心概念 | 企业级生产系统 |
+工业现场的预测性维护有四个典型难点，系统的设计直接对应它们：
 
-**两套系统互不干扰**：CLI 版从 CSV 读数据，API 版从 SQLite 读数据。修改其中一套不会影响另一套。
+| 难点 | 系统的做法 |
+| --- | --- |
+| **健康退化难发现**——单点阈值报警要么太晚要么太吵 | 用**同侪包络**判据替代绝对阈值：把每台设备放进全厂同型号健康设备的群体里比较，只有「显著离群」才算异常。全厂一起缓慢老化不会被当成 100 台同时故障 |
+| **故障类型难定位**——轴承磨损和散热故障都会推高温度 | 用**同侪偏差**找专属征兆（冷却水温只有散热故障才会偏离），按征兆**独特性**排序做故障隔离 |
+| **维护时机难决策**——「现在停机修」和「再跑几天」代价不同 | 输出 **P10/P50/P90** 三档剩余寿命，并对「立即维修 / 计划窗口维修 / 减载运行 20%」三种方案用**同一套成本口径**定价，取总成本最低者 |
+| **结论无法追责**——运维决策必须能解释为什么 | 每次诊断构造 **E1–E7** 七条可逐条回溯的证据链，报告里每个数字都注明数据出处 |
+
+系统的三层结构：
+
+| 层 | 职责 |
+| --- | --- |
+| **数据层** | 确定性物理仿真（Paris 疲劳 / Arrhenius 热老化 / Taylor 刀具磨损）、工况调制、时序落库、数据血缘 |
+| **Agent 引擎层** | LangGraph 状态图（7 个诊断节点 + 3 个聊天节点）、8 个技能包、知识层（FMECA / 因果图 / 案例 / 混合 RAG）、四层记忆、混合 LLM 路由、自主循环 |
+| **应用层** | 51 个 HTTP/WS 接口、10 页 React 控制台、JWT 三角色权限、报告导出与 IM 推送 |
+
+一条重要的运行前提：**系统默认不调用大模型也能完整运行**——诊断、预测、决策、报告、自检全部是确定性算法与数据库实况，LLM 只作为可选的措辞润色与候选校验。
 
 ---
 
-## 2. 快速启动
+## 2. 技术栈速览
 
-### 2.1 环境准备
+| 层 | 技术 |
+| --- | --- |
+| 运行环境 | Python 3.12（项目在 `.venv` 中验证） |
+| Agent 编排 | **LangGraph** 1.2+（`StateGraph` / 条件边 / `MemorySaver` 检查点）+ langchain-core |
+| 后端 | FastAPI 0.128+ · Uvicorn · Pydantic 2 · python-dotenv · **PyJWT**（HS256 认证） |
+| 存储 | **SQLite（WAL 模式）** 14 张业务表 · pickle 稀疏索引 · ChromaDB（可选稠密索引） |
+| 检索 | BM25（`k1=1.5, b=0.75`）+ bge-m3 稠密（**1024 维**）+ **RRF**（`K=60`，权重 1.0 / 0.9） |
+| 图算法 | NetworkX（故障因果传播图，14 节点 / 12 条边） |
+| 数值 | NumPy · Pandas · SciPy · scikit-learn |
+| 前端 | React 18 · TypeScript 5 · Vite 5 · Tailwind CSS 3 · **echarts 5** · lucide-react 图标 |
+| LLM（可选） | Ollama 本地 `qwen2.5:7b`（monitor / knowledge / reflection / chat）+ `bge-m3`（嵌入）；DeepSeek 云端 `deepseek-chat`（diagnostic / prediction / decision / report） |
+| 测试 | pytest（**44 项**，约 2.3 s，8 个文件） |
+
+---
+
+## 3. 快速启动
+
+### 3.1 准备环境
 
 ```bash
-# 1. 进入项目目录
-cd D:\daima\ziweixianzhi_langgraph
-
-# 2. 创建/激活虚拟环境
+# 1) 创建虚拟环境（Python 3.12）
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\python.exe -m pip install -U pip
 
-# 3. 安装依赖
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 2) 安装依赖（国内建议用清华源）
+.venv\Scripts\pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 4. 确保 Ollama 在运行（本地 LLM）
-ollama list
-# 应看到: qwen2.5:7b, bge-m3, zhiwei-monitor, zhiwei-knowledge, zhiwei-reflection
-# 如果没有，执行:
-# ollama pull qwen2.5:7b
-# ollama pull bge-m3
+# 3) 复制环境变量模板（不含任何密钥）
+copy .env.example .env
 ```
 
-### 2.2 启动系统A（CLI 教学版）
+### 3.2 生成数据库（首次 clone 必须执行）
+
+> **仓库里不包含 `.db` 文件。** 首次运行前必须先本地生成数据库。
+> ⚠️ `regenerate` 会先删除再重建整个数据库文件——仅在首次生成或确需全量重建时执行；日常局部重算用 `scripts/recompute_fault_readings.py`。
 
 ```bash
-# 分析指定设备
-python src/main.py --devices CNC_007 CNC_012
-
-# 分析默认设备
-python src/main.py
+.venv\Scripts\python.exe -m src.database.regenerate
 ```
 
-**输出**：在终端打印完整的分析报告，包括风险等级、证据链 E1-E7、成本分析、自验收结果。
+这一步会：建表 → 从 `data/raw/MACHINE_SUMMARY_DATA._2025.csv` 载入 100 台设备主数据 → upsert 9 条 FMECA 规则与 4 条案例 → 用仿真器生成 **100 台 × 14 天 × 30 分钟** 的 22 维遥测（共 **67202 条**，`data/zhiwei.db` 约 62.25 MB）。耗时约 2–3 分钟，期间会按每 10 台打印进度。
 
-### 2.3 启动系统B（企业级 API 版）
+### 3.3 启动后端
 
 ```bash
-# 方式1：通过 backend/app.py 兼容入口
-python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
-
-# 方式2：直接指定 src/api/main.py
-python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
-
-# 方式3：直接运行 backend/app.py（推荐，自动 sys.path 修复）
-python backend/app.py
+.venv\Scripts\uvicorn src.api.main:app --host 127.0.0.1 --port 8000
 ```
 
-**访问地址**（必须用 `127.0.0.1` 或 `localhost`，**不能用 `0.0.0.0`**，否则浏览器会报 ERR_ADDRESS_INVALID）：
+> **必须绑定 `127.0.0.1`，不要用 `0.0.0.0`。** 前端的 WebSocket 与 CORS 白名单都按 `localhost` / `127.0.0.1` 配置。
 
-| 用途 | URL |
-|---|---|
-| API 文档（Swagger UI） | http://127.0.0.1:8000/docs |
-| 总览仪表板 | http://127.0.0.1:8000/api/overview |
-| 设备列表 | http://127.0.0.1:8000/api/machines |
-| 触发诊断 | `POST http://127.0.0.1:8000/api/diagnostics/trigger` |
-| 拓扑图数据 | http://127.0.0.1:8000/api/topology |
-| 健康检查 | http://127.0.0.1:8000/health |
+启动时 `lifespan` 会自动：装载数据库 → 构建因果图 → 编译 7 节点诊断图 → 创建 `ActivityBus` 与 `AutonomousLoop` → 发现 8 个技能 → **播种初始管理员账号**（幂等，凭据取自 `.env` 的 `ADMIN_USERNAME` / `ADMIN_PASSWORD`）。**自主循环与实时引擎默认关闭**，属正常现象。
 
-### 2.4 启动前端（配合系统B）
+后端日志写在项目根目录 `_backend.log`；结构化日志写在 `data/logs/`。
+
+### 3.4 启动前端
 
 ```bash
 cd web
 npm install
 npm run dev
-# 前端运行在 http://localhost:5173
 ```
 
-### 2.5 重建数据库（**首次 clone 后必做**）
+Vite 固定监听 `http://127.0.0.1:5173`（见 `web/vite.config.ts`）。首次打开会跳转登录页，用 `.env` 里的管理员账号登录；右上角可切换浅色 / 暗色主题。
 
-> 仓库不包含 `data/zhiwei.db`（约 56MB，已列入 `.gitignore`）。首次 clone 后必须先生成数据库，否则系统没有数据可分析。生成过程约 2-3 分钟。
-
-如果数据库数据损坏或需要重新生成：
+### 3.5 可选：构建知识索引
 
 ```bash
-# 重新生成 100 台设备 × 14 天 × 22 维传感器数据（约需 2-3 分钟）
-python -m src.database.regenerate
+# 构建 BM25 + 稠密索引（稠密部分需要本地 Ollama 提供 bge-m3）
+.venv\Scripts\python.exe scripts/rag_tools.py build
 
-# 或用原始 CSV 初始化（4 维传感器，2999 条）
-python -m src.database.init_db
+# 评估检索效果（12 条查询的 recall@5，当前 11/12）
+.venv\Scripts\python.exe scripts/rag_tools.py eval
 ```
 
-### 2.6 重建知识索引与 RAG 评估（可选）
+首次提问或首次调用知识检索时，系统也会自动构建索引（`KnowledgeIndex.ensure()`），因此这一步不是必须的。索引落在 `data/index/`（`bm25.pkl` + `chunks.json` + `fingerprint.json`）。
 
-知识索引基于源文档指纹增量重建（源文档未变时自动跳过嵌入，秒级完成）：
+### 3.6 访问地址
+
+| 入口 | 地址 | 说明 |
+| --- | --- | --- |
+| 前端控制台 | http://127.0.0.1:5173 | 10 个页面（需登录） |
+| API 文档（Swagger） | http://127.0.0.1:8000/docs | 49 个 REST 接口 |
+| 服务元信息 | http://127.0.0.1:8000/ | 名称 / 版本 / 状态 |
+| 健康检查 | http://127.0.0.1:8000/health | 数据与 LLM 依赖状态 |
+| 全厂 KPI | http://127.0.0.1:8000/api/overview | 设备 / 诊断 / 工单汇总（需令牌） |
+
+### 3.7 跑测试
 
 ```bash
-# 构建/刷新知识索引（108 chunks，6 类文档，bge-m3 嵌入）
-.venv/Scripts/python.exe scripts/rag_tools.py build
-
-# 评估召回率（内置 12 条带预期命中的测试查询，实测 recall@5 = 1.0）
-.venv/Scripts/python.exe scripts/rag_tools.py eval
+.venv\Scripts\python.exe -m pytest tests/ -q
+# 期望输出：44 passed
 ```
 
-### 2.7 数据库表自动迁移
+测试全部跑在临时文件库上，不触碰 `data/zhiwei.db`，也不触发任何网络调用；其中 `tests/test_auth.py` 覆盖口令哈希、JWT 签发校验、用户 CRUD、角色依赖与管理员播种。
 
-`Database` 初始化时会自动执行 `initialize_schema()`（全部 `IF NOT EXISTS` 幂等），对话线程/长期记忆/维护报告/数据血缘等新表在首次启动时自动创建，无需手工迁移。
-
----
-
-## 3. 已知问题修复记录
-
-### 3.1 浏览器访问 `0.0.0.0:8000` 报 ERR_ADDRESS_INVALID（本次修复）
-
-**症状**：后端正常启动（终端显示 `Uvicorn running on http://0.0.0.0:8000` + 多个 200 OK），但浏览器输入 `http://0.0.0.0:8000/` 显示"无法访问此页面" / `ERR_ADDRESS_INVALID`。
-
-**根因**：`0.0.0.0` 是监听所有网络接口的特殊地址，**不能作为浏览器访问地址**。Chromium 系浏览器对 `0.0.0.0` 统一返回 `ERR_ADDRESS_INVALID`。
-
-**修复**：
-- `backend/app.py` 已把 `host="0.0.0.0"` 改为 `host="127.0.0.1"`（仅本机访问，最常用）
-- 如需局域网内其他机器访问，临时改回 `0.0.0.0`，访问方用 `http://<你的IP>:8000`
-- 浏览器必须用 `http://127.0.0.1:8000/...` 或 `http://localhost:8000/...`
-
-**路径前缀**：所有业务端点都在 `/api/` 下，旧 README 漏写了：
-- ❌ `/overview` / `/machines` / `/diagnose/CNC_007`（404）
-- ✅ `/api/overview` / `/api/machines` / `/api/diagnostics/trigger`
-
-### 3.2 ModuleNotFoundError: No module named 'src'（本次修复）
-
-**错误现象**：
-```
-ModuleNotFoundError: No module named 'src'
-```
-
-**根因**：项目用 `from src.xxx import ...` 绝对导入，但只有 `src/main.py` 有 `sys.path.insert(0, 项目根目录)` 修复。其他入口文件（`backend/app.py`、`src/api/main.py`、`src/database/regenerate.py`）直接运行时，Python 把脚本所在目录加入 `sys.path[0]`，而不是项目根目录，导致找不到 `src` 包。
-
-**修复**：在三个入口文件的 `from src.xxx import` 之前统一添加 `sys.path` 修复：
-```python
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 上溯到项目根
-```
-
-**验证结果**：
-- `python backend/app.py` → uvicorn 成功启动 ✅
-- `python src/main.py --devices CNC_007` → 完整运行到 Analysis Agent ✅
-- `python src/database/regenerate.py` → 导入成功 ✅
-
-> **注意**：用 `python -m uvicorn backend.app:app` 或 `python -m src.database.regenerate`（带 `-m`）启动时不会有此问题，因为 `-m` 模式会自动把当前目录加入 sys.path。只有直接 `python 文件路径` 运行时才需要 sys.path 修复。
-
-### 3.3 CSV 设备ID列名不匹配
-
-**错误现象**：
-```
-AttributeError: 'str' object has no attribute 'nunique'
-```
-
-**根因**：CSV 文件的设备ID列名是 `equipment_id`，但 `data_loader.py` 只查找 `device_id` 和 `Machine_ID`。两个都找不到时，`df.get()` 返回字符串（列名）而非列对象，字符串没有 `.nunique()` 方法。
-
-**修复**：在 `src/tools/data_loader.py` 的 `_find_id_column()` 函数中增加 `equipment_id` 到候选列表，并将 line 47 改为安全调用方式：
-```python
-# 修复前（有 bug）
-print(f"设备数: {df.get('device_id', df.get('Machine_ID', df.columns[0])).nunique()}")
-
-# 修复后
-id_col = _find_id_column(df)
-print(f"设备数: {df[id_col].nunique()}  (ID列: {id_col})")
-```
-
-### 3.4 历史修复记录
-
-| 问题 | 修复位置 | 说明 |
-|------|----------|------|
-| ModuleNotFoundError: No module named 'src' | `backend/app.py`, `src/api/main.py`, `src/database/regenerate.py` | 三个入口文件缺少 sys.path 修复，已统一添加 |
-| FAULT_MODELS/RISK_LEVELS 未定义 | `src/config/__init__.py` | 补充了 10 种故障模式 + 4 级风险配置 |
-| .env 缺企业变量 | `.env` | 补充 OLLAMA_MONITOR/KNOWLEDGE/REFLECTION_MODEL 等 |
-| tsconfig 缺 Vite 类型 | `web/tsconfig.json` | 添加 `"types": ["vite/client"]` |
-| 旧数据 4 维/72.3% 故障率 | `src/database/regenerate.py` | 重建为 22 维/6% 故障率/67200 条 |
-| severity 全显示 normal | `src/api/main.py` | 改用存储的 health_score + fault_code 判定 |
-| detect_anomaly 基线问题 | `src/skills/anomaly_detect.py` | 改用前 40% 数据作健康基线 |
-
----
-
-## 4. 数据层详解
-
-### 4.1 数据从哪来？
-
-项目有**三个数据源**，服务于不同系统：
-
-#### 数据源 1：原始竞赛 CSV（系统A使用）
-
-```
-data/raw/MACHINE_LOG_DATA._2025.csv    — 2999 条设备日志
-data/raw/MACHINE_SUMMARY_DATA._2025.csv — 100 台设备元数据
-data/raw/PRODUCT_ASSEMBLY_LINE_WITH_MACHINES_2025.csv — 产线配置
-data/raw/PRODUCT_ASSEMBLY_LINE_WITH_MACHINES_TESTS_2025.csv — 质量测试
-```
-
-**CSV 列结构**（MACHINE_LOG_DATA）：
-```
-timestamp, equipment_id, failure_type, current, temperature, voltage, speed
-2025/5/18 0:00, CNC_001, 0, 27.41, 83.01, 223.04, 300
-```
-
-- 5 维传感器：current(电流), temperature(温度), voltage(电压), speed(转速), power(功率=电流×电压)
-- 100 台 CNC 设备，每台约 30 条记录
-- 时间跨度：约 7 小时（2025/5/18 0:00 ~ 7:00）
-- failure_type：0=正常，其他=故障类型
-
-**特点**：这是竞赛原始数据，维度少、时间短，适合学习但不适合做退化建模。
-
-#### 数据源 2：SQLite 仿真数据库（系统B使用）
-
-```
-data/zhiwei.db — 51MB，6 张表
-```
-
-| 表名 | 行数 | 说明 |
-|------|------|------|
-| `machines` | 100 | 设备元数据（型号、产线、维护日期、日产量、单位成本） |
-| `sensor_readings` | 67200 | 22 维传感器读数 + health_score + fault_code |
-| `fmeca_rules` | 9 | FMECA 故障模式规则（故障码/名称/系统/部件/SOP步骤/备件/工时） |
-| `case_library` | 4 | 历史维护案例 |
-| `diagnostics` | 按需增长 | 诊断结果快照 |
-| `maintenance_records` | 按需增长 | 维护工单 |
-
-**特点**：由仿真器生成，维度全、时间长、故障率合理，适合企业级分析。
-
-#### 数据源 3：内嵌知识库（系统A使用）
-
-系统A的 RAG Agent 内嵌了 17 条知识（7 个案例 + 10 种故障模式），直接写在 `src/agents/rag.py` 代码中，不依赖外部数据库。
-
-### 4.2 数据有多少？
-
-| 维度 | CSV 原始数据 | SQLite 仿真数据 |
-|------|-------------|----------------|
-| 记录总数 | 2,999 条 | 67,200 条 |
-| 设备数量 | 100 台 | 100 台 |
-| 传感器维度 | 5 维 | 22 维 |
-| 时间跨度 | ~7 小时 | 14 天 |
-| 采样间隔 | 不固定 | 30 分钟 |
-| 故障率 | 72.3%（不真实） | 6%（6 台设备有渐进式故障） |
-| 每台设备记录数 | ~30 条 | 672 条 |
-
-### 4.3 仿真器是什么？
-
-仿真器是一组 Python 模块，用**物理退化模型**生成合成的 CNC 设备传感器数据。它不是简单的随机数生成，而是基于真实的物理公式：
-
-#### 仿真器架构
-
-```
-src/simulator/
-├── cnc_simulator.py    — 主仿真器（协调所有子模型）
-├── physics_models.py   — 物理退化模型（3 个核心公式）
-├── sensor_models.py    — 传感器噪声模型（高斯+漂移+尖峰）
-├── fault_injector.py   — 故障注入器（6 台设备的故障场景）
-└── run_simulation.py   — 批量仿真脚本
-```
-
-#### 三大物理退化模型
-
-| 模型 | 公式 | 作用 | 文件 |
-|------|------|------|------|
-| **Paris 疲劳裂纹模型** | da/dN = C(ΔK)^m | 模拟轴承疲劳裂纹扩展，影响振动和温度 | `physics_models.py` |
-| **Arrhenius 热加速模型** | rate = A·exp(-Ea/kT) | 模拟温度对电子器件老化的加速作用 | `physics_models.py` |
-| **Taylor 刀具寿命模型** | T = C·v^(-1/n)·f^(-1/m) | 模拟切削刀具磨损，影响电流和加工质量 | `physics_models.py` |
-
-#### 22 维传感器清单
-
-```
-op_voltage          — 工作电压
-op_amperage         — 工作电流
-op_temperature      — 工作温度
-rotor_speed         — 转子转速
-vibration_rms       — 振动均方根值
-motor_power         — 电机功率
-cutting_force       — 切削力
-feed_force          — 进给力
-spindle_load        — 主轴负载
-coolant_temp         — 冷却液温度
-coolant_pressure     — 冷却液压力
-oil_pressure        — 油压
-noise_level         — 噪声水平
-tool_wear           — 刀具磨损量
-surface_roughness    — 表面粗糙度
-position_error      — 位置误差
-power_factor        — 功率因数
-harmonic_distortion  — 谐波失真
-bearing_temp         — 轴承温度
-motor_vibration      — 电机振动
-ambient_temp         — 环境温度
-humidity            — 湿度
-```
-
-#### 故障注入器
-
-`fault_injector.py` 为 6 台设备注入渐进式故障：
-
-| 设备 | 故障类型 | 注入方式 |
-|------|----------|----------|
-| CNC_007 | 轴承磨损 | 振动逐步增大，轴承温度上升 |
-| CNC_018 | 刀具磨损 | 电流增大，切削力变化 |
-| CNC_025 | 冷却系统故障 | 冷却液温度上升，压力下降 |
-| CNC_036 | 电机过热 | 电机温度急升，电流波动 |
-| CNC_052 | 电源模块老化 | 电压波动增大 |
-| CNC_078 | 进给系统卡滞 | 进给力增大，转速不稳定 |
-
-#### 仿真器工作流程
-
-```
-CNCSimulator.get_reading(machine_id, timestamp)
-    │
-    ├─→ 1. 查询设备元数据（型号、已运行天数）
-    │
-    ├─→ 2. 计算基础退化量
-    │      ├─ Paris 模型 → 轴承退化 → 影响振动/温度
-    │      ├─ Arrhenius → 电路老化 → 影响电压/电流
-    │      └─ Taylor → 刀具磨损 → 影响电流/切削力
-    │
-    ├─→ 3. 故障注入器叠加故障信号
-    │      └─ 如果该设备有注入故障，叠加故障特征
-    │
-    ├─→ 4. 传感器模型添加噪声
-    │      ├─ 高斯噪声（正常波动）
-    │      ├─ 传感器漂移（缓慢偏移）
-    │      └─ 随机尖峰（偶发干扰）
-    │
-    └─→ 5. 输出 22 维传感器读数 + fault_code
-```
-
----
-
-## 5. 文件结构全景图
-
-```
-D:\daima\ziweixianzhi_langgraph\
-│
-├── src/
-│   ├── main.py                        # ★ 系统A入口：python src/main.py
-│   ├── state.py                       # ★ 系统A状态定义 (AgentState)
-│   │
-│   ├── config/
-│   │   ├── __init__.py                # 配置中心：路径/22维传感器/故障模型/风险等级
-│   │   └── model_routing.py          # LLM 模型路由表（7个Agent各用哪个模型）
-│   │
-│   ├── llm/
-│   │   ├── __init__.py               # LLM 工厂函数 (get_llm/get_agent_llm)
-│   │   └── client.py                 # 统一 LLM 客户端（Ollama + DeepSeek 双路由）
-│   │
-│   ├── tools/                        # ★ 系统A工具层
-│   │   ├── data_loader.py            # CSV 数据加载（从原始竞赛CSV读取5维数据）
-│   │   ├── feature_engineering.py    # 22维特征工程（统计+频域+交叉耦合）
-│   │   ├── algorithms.py             # 6大算法库（威布尔/马氏/贝叶斯/IF/CUSUM/Zscore）
-│   │   └── type_converter.py         # numpy→Python原生类型转换
-│   │
-│   ├── agents/                       # ★ 两套系统的Agent都在这里
-│   │   │
-│   │   │  === 系统A: CLI教学版 ===
-│   │   ├── supervisor.py             # 调度Agent：接收设备列表→创建分析任务
-│   │   ├── data_pipeline.py          # 数据管道：加载CSV→提取时序→22维特征
-│   │   ├── analysis.py              # ★ ReAct分析：LLM推理+工具调用→异常检测+RUL
-│   │   ├── diagnosis.py             # 诊断Agent：E1-E7证据链→故障匹配
-│   │   ├── decision.py              # 决策Agent：成本分析→维护工单
-│   │   ├── self_check.py            # ★ 自验收：5项检查→pass/fail→条件边路由
-│   │   ├── rag.py                   # RAG：关键词检索17条案例知识
-│   │   │
-│   │   │  === 系统B: 企业级API版 ===
-│   │   ├── state.py                 # ★ 系统B状态定义 (DiagnosticState)
-│   │   ├── monitor_agent.py          # 监控Agent：读取传感器→异常检测→路由判定
-│   │   ├── diagnostic_agent.py       # 诊断Agent：三信号融合→故障诊断→证据链
-│   │   ├── knowledge_agent.py        # 知识Agent：FMECA规则+因果图+案例检索
-│   │   ├── prediction_agent.py       # 预测Agent：威布尔RUL→P10/P50/P90
-│   │   ├── decision_agent.py         # 决策Agent：3方案成本对比→维护建议
-│   │   ├── report_agent.py           # 报告Agent：生成结构化诊断报告
-│   │   └── reflection_agent.py       # 反思Agent：5项自检→通过/回退重试
-│   │
-│   ├── graph/                       # ★ 两套图引擎
-│   │   ├── build.py                 # 系统A图构建：8节点+条件边+MemorySaver
-│   │   ├── main_graph.py            # 系统B图构建：7节点+异步绑定+条件路由
-│   │   └── edges.py                 # 系统B路由函数（独立文件便于测试）
-│   │
-│   ├── skills/                      # ★ 系统B技能层：8个规范化子包 + 注册表
-│   │   ├── base.py                  # BaseSkill/SkillMeta/SkillRegistry（自动发现+tool_calls审计）
-│   │   ├── anomaly_detect/          # 异常检测：三信号融合+健康评分
-│   │   ├── rul_weibull/             # RUL预测：威布尔分布→P10/P50/P90
-│   │   ├── evidence_chain/          # E1-E7证据链：7维证据构建+贝叶斯融合
-│   │   ├── cost_benefit/            # 成本效益：预防vs纠正vs更换三方案对比
-│   │   ├── case_match/              # 案例匹配：历史维护案例检索
-│   │   ├── fault_graph_trace/       # 因果图查询：NetworkX故障传播路径
-│   │   ├── diagnostic_report/       # 诊断报告生成
-│   │   └── maintenance_report/      # 维护报告生成（审批联动，纯确定性拼装）
-│   │   （每个子包：schema.py + skill.py + SKILL.md）
-│   │
-│   ├── memory/                      # ★ 四层记忆架构
-│   │   └── manager.py               # MemoryManager门面：会话/情节/设备画像/语义
-│   │
-│   ├── data/                        # ★ 数据层增强
-│   │   ├── workload.py              # 工况调制：班次/换刀/保养窗口/周末单班
-│   │   └── realtime.py              # RealtimeEngine：真实时钟追加读数+数据血缘
-│   │
-│   ├── knowledge/                   # ★ 系统B知识层
-│   │   ├── fmeca.py                 # FMECA规则库：9条故障模式规则
-│   │   ├── fault_graph.py           # NetworkX因果图：14节点12边故障传播
-│   │   ├── chunking.py              # 6类源文档→108 chunks结构化分块
-│   │   ├── retrieval.py             # HybridRetriever：BM25+稠密+RRF融合
-│   │   ├── index_builder.py         # KnowledgeIndex：指纹增量重建
-│   │   └── vector_store.py          # ChromaDB向量库：bge-m3嵌入(1024维)
-│   │
-│   ├── database/                    # ★ 系统B数据层
-│   │   ├── connection.py            # SQLite事务仓库：9+张表CRUD（启动自动建表）
-│   │   ├── schemas.py               # 数据模型：MachineMetadata/SensorReading
-│   │   ├── init_db.py               # 初始化脚本：从CSV加载+FMECA规则+案例
-│   │   └── regenerate.py            # ★ 重建脚本：仿真器生成22维×14天×100台
-│   │
-│   ├── agents/
-│   │   ├── chat_agent.py            # ★ 第三条图：classify_intent→dispatch→compose
-│   │   └── ...（系统A/B 各Agent）
-│   │
-│   ├── simulator/                   # ★ 物理仿真器
-│   │   ├── cnc_simulator.py         # 主仿真器：协调子模型→输出22维读数
-│   │   ├── physics_models.py         # 物理退化：Paris/Arrhenius/Taylor三大公式
-│   │   ├── sensor_models.py         # 传感器噪声：高斯+漂移+尖峰
-│   │   ├── fault_injector.py        # 故障注入：6台设备渐进式故障场景
-│   │   └── run_simulation.py        # 批量仿真：一键生成全部数据
-│   │
-│   └── api/
-│       └── main.py                  # ★ 系统B的FastAPI后端：50条REST+SSE+WebSocket
-│
-├── backend/
-│   └── app.py                       # 兼容入口：转发到 src.api.main:app
-│
-├── scripts/
-│   └── rag_tools.py                 # 知识索引构建(build) + 召回率评估(eval)
-│
-├── web/                             # ★ 系统B前端
-│   ├── src/
-│   │   ├── App.tsx                  # 薄壳：10导航项+WebSocket轮询
-│   │   ├── api.ts / types.ts        # API客户端与类型
-│   │   ├── components/ui.tsx        # 原子组件+RiskBadge+HealthBar
-│   │   ├── pages/                   # fleet/agents/knowledge/chat 四页面
-│   │   └── TrendChart.tsx           # 22维趋势图组件
-│   ├── package.json
-│   └── vite.config.ts
-│
-├── data/
-│   ├── raw/                         # 原始竞赛CSV文件（4个）
-│   └── zhiwei.db                    # ★ SQLite仿真数据库（51MB，67200条）
-│
-├── docs/
-│   ├── AGENTS.md                    # 项目宪法（Codex产出）
-│   ├── PROJECT_MASTER.md            # 完整规格书（领域知识+架构+算法+约束）
-│   ├── 企业级Agent建设规划.md
-│   ├── 系统架构设计文档.md
-│   ├── 模型选型与部署方案.md
-│   └── 问题日志.md
-│
-├── .env                             # 环境变量配置
-├── requirements.txt                 # Python依赖清单
-├── README.md                        # ★ 你正在看的这个文件
-└── 项目详细报告.md                   # 完整技术报告（14章）
-```
-
----
-
-## 6. 每个文件做什么怎么做
-
-### 6.1 入口文件
-
-#### `src/main.py` — 系统A CLI入口
-- **做什么**：解析命令行参数 → 构建状态图 → 执行分析 → 打印报告
-- **怎么做**：`argparse` 解析 `--devices` 和 `--thread` → 调用 `build_analysis_graph()` → 调用 `run_analysis()` → 格式化输出
-- **运行方式**：`python src/main.py --devices CNC_007 CNC_012`
-
-#### `backend/app.py` — 系统B兼容入口
-- **做什么**：转发到 `src.api.main:app`，让 `uvicorn backend.app:app` 能正常工作
-- **怎么做**：`from src.api.main import app` + `uvicorn.run()`
-
-### 6.2 配置层
-
-#### `src/config/__init__.py` — 配置中心
-- **做什么**：定义所有路径常量、22 维传感器列名、10 种故障模型、4 级风险等级
-- **关键变量**：
-  - `DATA_FILES` — CSV 文件路径
-  - `SENSOR_COLUMNS` — 22 维传感器列名元组
-  - `FAULT_MODELS` — 10 种故障（F001-F010），供系统A的 `diagnosis.py` 使用
-  - `RISK_LEVELS` — 4 级风险配置（critical/high/medium/low），供系统A的 `decision.py` 使用
-  - `DATABASE_URL` — SQLite 路径
-
-#### `src/config/model_routing.py` — LLM 路由表
-- **做什么**：定义 7 个 Agent 各自使用哪个 LLM 模型
-- **路由策略**：
-  - Monitor/Knowledge → 本地 Ollama（zhiwei-monitor, zhiwei-knowledge）
-  - Diagnostic/Prediction/Decision/Report → 云端 DeepSeek API
-  - Reflection → 本地 Ollama（zhiwei-reflection, temp=0.0）
-
-#### `src/llm/client.py` — 统一 LLM 客户端
-- **做什么**：封装 Ollama + DeepSeek 双路由，自动切换
-- **怎么做**：检查 DeepSeek API Key 是否可用 → 可用则走云端，不可用则回退本地 Ollama
-
-### 6.3 系统A：工具层
-
-#### `src/tools/data_loader.py` — CSV 数据加载
-- **做什么**：从 `MACHINE_LOG_DATA._2025.csv` 加载 5 维传感器数据
-- **怎么做**：`pd.read_csv()` → 自动识别设备ID列（`equipment_id`/`device_id`/`Machine_ID`）→ 按设备ID提取时序数据
-- **调优入口**：
-  - 增加新数据源 → 修改 `DATA_FILES` 配置 + 在 `load_machine_logs()` 中添加加载逻辑
-  - 支持新列名 → 在 `_find_id_column()` 的 `candidates` 列表中添加
-
-#### `src/tools/feature_engineering.py` — 22 维特征工程
-- **做什么**：从 5 维原始数据提取 22 维特征
-- **特征分层**：
-  - 第1层（5维）：基础参数均值（temp/current/voltage/speed/power）
-  - 第2层（7维）：工程衍生（焦耳热/功率因数/散热效率/负载指数/转速稳定性/温升速率/电流-温度耦合）
-  - 第3层（4维）：统计特征（变异系数/偏度/峰度/IQR比）
-  - 第4层（3维）：频域特征（主频/频谱熵/高频能量比）— 使用 FFT
-  - 第5层（3维）：交叉耦合（温度-转速/电压-电流/功率-负载）
-- **调优入口**：
-  - 增加特征 → 在 `compute_22d_features()` 中添加新的特征计算
-  - 修改特征权重 → 在 `algorithms.py` 的 `bayesian_fusion()` 中调整 `weight` 参数
-
-#### `src/tools/algorithms.py` — 6 大算法库
-- **做什么**：提供系统A所有检测算法
-- **算法清单**：
-  1. `weibull_rul_estimation()` — 威布尔分布 RUL 预测（MLE 拟合 + 条件故障概率）
-  2. `mahalanobis_distance()` — 马氏距离故障匹配（MinCovDet + 卡方阈值）
-  3. `bayesian_fusion()` — 贝叶斯 Log-Odds 多证据融合
-  4. `isolation_forest_detect()` — Isolation Forest 异常检测
-  5. `cusum_detection()` — CUSUM 累积和检测（早期退化捕捉）
-  6. `zscore_anomaly_detection()` — Z-Score 快速异常检测
-- **调优入口**：
-  - 威布尔参数 → 修改 `weibull_rul_estimation()` 中的 `operating_hours` 默认值
-  - 异常检测灵敏度 → 调整 `zscore_anomaly_detection()` 的 `threshold`（默认 2.5）
-  - CUSUM 触发阈值 → 调整 `cusum_detection()` 的 `threshold`（默认 5.0）
-
-### 6.4 系统A：Agent 层
-
-#### `src/agents/supervisor.py` — 调度 Agent
-- **做什么**：接收设备列表 → 创建分析任务 → 调用 LLM 确认
-- **输出**：`analysis_tasks` 列表 + 确认消息
-
-#### `src/agents/data_pipeline.py` — 数据管道
-- **做什么**：调用 `data_loader` 加载 CSV → 提取每台设备时序 → 调用 `feature_engineering` 计算 22 维特征
-- **输出**：`raw_data`（时序字典）+ `feature_vectors`（特征字典）
-
-#### `src/agents/analysis.py` — ReAct 分析 Agent ★核心
-- **做什么**：使用 LangGraph 的 `create_react_agent` 创建 ReAct 智能体，LLM 自主选择工具分析数据
-- **工具**：`analyze_temperature` / `analyze_current` / `estimate_rul` / `comprehensive_device_analysis`
-- **降级策略**：ReAct 失败时回退到纯算法 `comprehensive_analysis()`
-
-#### `src/agents/diagnosis.py` — 诊断 Agent
-- **做什么**：构建 E1-E7 七段证据链 → 匹配故障类型 → 计算综合风险
-- **E1-E7 定义**：
-  - E1=温度异常 / E2=电流异常 / E3=电压稳定性 / E4=转速波动
-  - E5=综合异常评分 / E6=寿命预测 / E7=趋势分析
-- **故障匹配**：基于 `FAULT_MODELS` 的参数匹配规则，按匹配度排序返回 Top-3
-
-#### `src/agents/decision.py` — 决策 Agent
-- **做什么**：根据风险等级制定维护建议 → 成本分析 → 生成 SOP 工单
-- **成本模型**：预防性维护 vs 故障后维修，计算节省金额和百分比
-
-#### `src/agents/self_check.py` — 自验收 Agent ★核心
-- **做什么**：5 项检查 → pass/fail → 通过则继续，不通过则回退到 analysis
-- **5 项检查**：结构完整性 / 逻辑一致性 / 数值合理性 / 证据链完整性 / 故障匹配质量
-- **循环逻辑**：最多 3 次重试，超过则带警告输出（不阻塞）
-
-#### `src/agents/rag.py` — RAG 知识检索
-- **做什么**：从内嵌的 17 条知识中关键词检索相关案例
-- **为什么不用向量库**：知识库小（17条），关键词匹配更快更可靠
-
-### 6.5 系统B：Agent 层
-
-系统B的 7 个 Agent 全部异步实现（`async def`），每个 Agent 都有确定性算法兜底——即使 LLM 不可用也能完整运行。
-
-#### `src/agents/monitor_agent.py` — 监控 Agent
-- **做什么**：从 SQLite 读取最新传感器数据 → 调用 `anomaly_detect` 检测异常 → 设置 `is_anomaly` 标志
-- **路由**：正常 → END；异常 → 进入诊断
-
-#### `src/agents/diagnostic_agent.py` — 诊断 Agent
-- **做什么**：三信号融合（Z-Score + CUSUM + 趋势）→ 构建 E1-E7 证据链 → 匹配 FMECA 故障规则
-- **兜底**：LLM 失败时用确定性规则匹配
-
-#### `src/agents/knowledge_agent.py` — 知识 Agent
-- **做什么**：查询 FMECA 规则库 → 查询 NetworkX 因果图 → 检索历史案例
-- **输出**：结构化的故障知识上下文
-
-#### `src/agents/prediction_agent.py` — 预测 Agent
-- **做什么**：调用 `rul_weibull` 技能 → 计算 RUL 的 P10/P50/P90 分位数
-- **兜底**：LLM 失败时用纯威布尔计算
-
-#### `src/agents/decision_agent.py` — 决策 Agent
-- **做什么**：调用 `cost_benefit` 技能 → 3 方案对比（预防/纠正/更换）→ 生成维护建议
-- **兜底**：LLM 失败时用确定性成本计算
-
-#### `src/agents/report_agent.py` — 报告 Agent
-- **做什么**：汇总所有结果 → 生成结构化 Markdown 诊断报告
-- **纯代码生成**：不依赖 LLM，确保格式一致
-
-#### `src/agents/reflection_agent.py` — 反思 Agent
-- **做什么**：5 项自检（证据完整性/逻辑一致性/数值合理性/RUL置信度/建议可执行性）
-- **路由**：通过 → END；不通过 → 回退到 diagnostic（最多 3 次）
-
-### 6.6 系统B：技能层（Skills 注册表）
-
-技能层已从单文件重构为**规范化子包 + 注册表**架构：
-
-- `src/skills/base.py` — 定义 `BaseSkill`（统一 run 接口 + `SkillMeta` 元数据）与 `SkillRegistry`（自动发现：扫描 skills/ 下所有子包，读取各子包 `skill.py` 并注册；`run()` 执行结果自动写入 `tool_calls` 审计表）
-- 每个技能是一个子包：`schema.py`（输入/输出 dataclass）+ `skill.py`（实现）+ `__init__.py` + `SKILL.md`（说明文档）
-
-**8 个技能子包**：
-
-| 子包 | 技能 ID | 做什么 |
-|------|---------|--------|
-| `anomaly_detect/` | `anomaly_detect` | 三信号融合（Z-Score+CUSUM+趋势）+ health_score |
-| `rul_weibull/` | `rul_weibull` | 威布尔 RUL + P10/P50/P90 分位数 |
-| `evidence_chain/` | `evidence_chain` | E1-E7 七维证据构建 + 贝叶斯融合 |
-| `cost_benefit/` | `cost_benefit` | 预防/纠正/更换三方案成本对比 |
-| `case_match/` | `case_match` | 历史维护案例检索 |
-| `fault_graph_trace/` | `fault_graph_trace` | NetworkX 故障传播路径查询 |
-| `diagnostic_report/` | `diagnostic_report` | 结构化 Markdown 诊断报告 |
-| `maintenance_report/` | `maintenance_report` | 维护报告生成（纯确定性拼装：设备档案/FMECA/维修史/案例，落库 `maintenance_reports`，带 `data_sources` 可追溯） |
-
-**注册与调用**：
-
-```python
-from src.skills.base import SkillRegistry
-
-SkillRegistry.discover()                      # 幂等，FastAPI lifespan 启动时自动执行
-meta = SkillRegistry.meta("maintenance_report")
-result = SkillRegistry.run("maintenance_report", machine_id="CNC_036", trigger="approval")
-```
-
-技能也可通过 REST 调用：`GET /api/skills` 列出全部、`POST /api/skills/{id}/run` 执行。
-
-### 6.7 系统B：记忆模块（四层记忆架构）
-
-`src/memory/manager.py` — `MemoryManager` 门面，四层记忆共用 SQLite 持久化：
-
-| 层 | 存储 | 说明 |
-|----|------|------|
-| 会话记忆 | `conversation_threads` + `conversation_messages` | 按线程存储对话；每 12 条自动滚动生成摘要，控制上下文长度 |
-| 情节记忆 | 复用 `diagnostics` / `maintenance_records` | 诊断与维护的历史事件 |
-| 设备画像 | `long_term_memory`（kind=machine） | `refresh_machine_profile()` 从情节层沉淀（severity 分组 + 维修历史汇总） |
-| 语义记忆 | `long_term_memory`（kind=fact/preference/lesson） | 人工或 Agent 写入的长期事实，按 kind+subject+content 去重，pinned 优先 |
-
-核心 API：`open_thread / append_message / recent_history`（会话）、`remember / recall / forget`（长期）、`build_context`（把相关记忆注入 LLM 提示词）、`refresh_machine_profile`（画像沉淀）。
-
-REST 端点：`GET/POST /api/memory`、`DELETE /api/memory/{id}`、`POST /api/memory/profile/{machine_id}/refresh`。
-
-### 6.8 系统B：聊天 Agent（第三条 StateGraph）
-
-`src/agents/chat_agent.py` — 在诊断图之外新增的第三条图，支撑前端聊天窗口：
-
-```
-classify_intent（关键词优先分类） → dispatch（确定性工具执行） → compose（LLM 组织语言 / 模板兜底）
-```
-
-- **5 类意图**：`machine_info`（设备信息）/ `machine_sop`（维护 SOP）/ `machine_records`（检测与维护记录）/ `report`（维护报告）/ `general`（知识库问答）
-- 设备 ID 提取：正则 `CNC[_\- ]?(\d{1,3})`
-- 意图路由走 `src/config/model_routing.py` 的 `"chat"` 配置，LLM 用 `UnifiedLLMClient`（DeepSeek 可用时云端，否则 Ollama + 模板兜底）
-- REST 端点：`POST /api/chat`、`GET /api/chat/threads`、`GET /api/chat/threads/{id}`
-
-### 6.9 系统B：混合检索 RAG（BM25 + 稠密 + RRF）
-
-`src/knowledge/` 三模块：
-
-| 模块 | 做什么 |
-|------|--------|
-| `chunking.py` | 6 类源文档（manual/spec/case/cost/fmeca/machine）→ 结构化分块，共 108 chunks，保留 section_path 层级 |
-| `retrieval.py` | `HybridRetriever`：BM25 关键词检索 + bge-m3 稠密向量检索（ChromaDB，1024 维）→ RRF（倒数排名融合）合并排序 |
-| `index_builder.py` | `KnowledgeIndex`：源文档指纹增量重建（未变则跳过嵌入）+ `ensure()` 幂等初始化 |
-
-调优入口：分块粒度改 `chunking.py`；检索权重/RRF 参数改 `retrieval.py`；重建策略改 `index_builder.py`。
-
-REST 端点：`POST /api/knowledge/search`（已接混合检索，返回 chunks 结果）。
-
-### 6.10 系统B：数据层工况调制与实时增强
-
-- `src/data/workload.py` — **工况调制**，让仿真数据更贴合真实生产节律：
-  - 白班满负荷 / 夜班降载 15% / 班次切换爬坡
-  - 换刀窗口（每 8 小时，负载瞬时波动）
-  - 周三保养窗口（停机，电流 ×0.05、温度回落）
-  - 周末单班
-  - `modulate_metrics()`：停机/降载时对电流、振动、温度做差异化线性调制（温度仅体现 40% 负荷差，符合热惯性）
-- `src/data/realtime.py` — **RealtimeEngine**：按 `REALTIME_STEP_MINUTES` 真实时钟追加调制读数，每次写入记录 `data_provenance`（数据血缘：来源/时间/参数），可追溯每条数据的生成方式
-- 默认 `REALTIME_ENABLED=0` 关闭；开启后通过 `POST /api/data/realtime/tick` 驱动
-- REST 端点：`GET /api/data/provenance`、`GET /api/data/realtime/status`
-
-### 6.11 维护报告审批联动（高风险 → 批准 → 自动生成）
-
-`src/database/connection.py` 的 `review_notification()` 内置审批联动：当**高风险/紧急**通知被管理员批准后，自动调用 `SkillRegistry.run("maintenance_report", ...)` 生成维护报告并落库 `maintenance_reports`，报告 ID 随审批结果返回前端。
-
-联调实测：审批 CNC_036 紧急通知 → 自动生成报告 `RPT-DEA7315984`。
-
-REST 端点：`GET /api/reports`、`GET /api/reports/{id}`。
-
-### 6.12 系统B：API 层
-
-#### `src/api/main.py` — FastAPI 后端
-- **做什么**：50 条 REST 路由 + SSE 流式推送 + WebSocket 实时通信
-- **端点分组**（`/api/` 前缀）：
-
-| 分组 | 代表端点 | 说明 |
-|------|---------|------|
-| 总览/设备 | `GET /api/overview`、`/api/machines`、`/api/machines/{id}/history` | 仪表板、设备列表、历史数据 |
-| 诊断 | `POST /api/diagnostics/trigger`、`/api/diagnostics`、`POST /api/diagnostics/stream` | 触发诊断、历史、SSE 流 |
-| 拓扑 | `GET /api/topology` | 设备拓扑图数据 |
-| 知识库 | `GET /api/knowledge/fmeca`、`POST /api/knowledge/search` | FMECA 规则、混合检索 |
-| 运维 | `GET/POST /api/operations/orders` | 维护工单 |
-| 通知 | `POST /api/notifications/{id}/review` | 审批联动维护报告生成 |
-| Skills | `GET /api/skills`、`POST /api/skills/{id}/run` | 注册表列表与执行 |
-| 聊天 | `POST /api/chat`、`GET /api/chat/threads/{id}` | 聊天 Agent、会话历史 |
-| 记忆 | `GET/POST /api/memory`、`POST /api/memory/profile/{id}/refresh` | 长期记忆 CRUD、画像沉淀 |
-| 报告 | `GET /api/reports`、`GET /api/reports/{id}` | 维护报告查询 |
-| 数据层 | `GET /api/data/provenance`、`/api/data/realtime/status`、`POST /api/data/realtime/tick` | 血缘、实时引擎 |
-| 运行日志 | `GET /api/logs` | tool_calls 审计与运行记录 |
-
-完整清单见 Swagger UI：http://127.0.0.1:8000/docs
-
-### 6.13 系统B：前端
-
-前端已从单文件 `App.tsx` 重构为**组件化**结构：
-
-```
-web/src/
-├── App.tsx              # 薄壳：导航 + WebSocket 轮询（10 个导航项，含待审徽标）
-├── api.ts / types.ts    # API 客户端与类型定义
-├── components/ui.tsx    # 通用原子组件 + RiskBadge（风险一眼可见）+ HealthBar（健康条）
-└── pages/
-    ├── fleet.tsx        # 总览：风险优先矩阵，故障/高风险设备置顶
-    ├── agents.tsx       # 运行日志：Agent 执行记录与 tool_calls 审计
-    ├── knowledge.tsx    # 知识库：混合检索结果与分块详情
-    └── chat.tsx         # 智能问答：聊天窗口（设备信息/SOP/记录）
-```
-
-- **尺寸锁定**：`.app-shell{height:100vh;overflow:hidden}` + 内容区固定 1280px，解决窗口缩放导致页面忽大忽小的问题
-- 通知审批界面显示报告联动结果；运行日志页可查看每次调用了什么、执行情况
-
----
-
-## 7. 系统A：CLI 教学版详解
-
-### 7.1 状态图结构
-
-```
-START
-  ↓
-[Supervisor]           ← 接收设备列表，创建分析任务
-  ↓
-[Data Pipeline]         ← 加载CSV → 5维时序 → 22维特征
-  ↓
-[Analysis] ←──────┐    ← ReAct推理 + 算法检测 + RUL预测
-  ↓               │
-[Diagnosis]       │    ← E1-E7证据链 + 故障匹配
-  ↓               │
-[Decision]        │    ← 成本分析 + 维护工单
-  ↓               │
-[Self-Check] ─────┘    ← 5项检查 → pass/fail (最多3次回退)
-  ↓ (pass)
-[RAG]                  ← 关键词检索案例知识
-  ↓
-[Report]               ← 生成Markdown报告
-  ↓
-END
-```
-
-### 7.2 条件边路由
-
-`route_after_check()` 函数根据 `verification_status` 决定下一步：
-- `"pass"` → 走到 `rag` 节点
-- `"fail"` → 回退到 `analysis` 节点
-- `"max_retry"` → 也走到 `rag` 节点（带警告输出，不阻塞）
-
-### 7.3 数据流
-
-```
-用户输入: CNC_007
-    ↓
-data_loader.load_machine_logs() → CSV → DataFrame (2999行, 7列)
-    ↓
-data_loader.get_device_data(df, "CNC_007") → 时序数据 (temperature, current, voltage, speed)
-    ↓
-feature_engineering.compute_22d_features() → 22维特征向量
-    ↓
-analysis_agent → ReAct LLM + comprehensive_analysis() → 风险评分 + RUL
-    ↓
-diagnosis_agent → build_evidence_chain() → E1-E7 → match_fault_type() → 故障Top3
-    ↓
-decision_agent → _calculate_costs() → 成本对比 → _generate_work_order() → 工单
-    ↓
-self_check_agent → 5项检查 → pass/fail
-    ↓
-rag_agent → keyword_search() → 案例知识
-    ↓
-report_generator → Markdown报告
-```
-
----
-
-## 8. 系统B：企业级 API 版详解
-
-### 8.1 状态图结构
-
-```
-START
-  ↓
-[Monitor]              ← 读取最新传感器数据 → 异常检测
-  ↓ (is_anomaly=True)        ↓ (is_anomaly=False)
-[Diagnostic]           END (正常，不进入诊断)
-  ↓
-[Knowledge]            ← FMECA规则 + 因果图 + 案例检索
-  ↓
-[Prediction]           ← 威布尔RUL → P10/P50/P90
-  ↓
-[Decision]             ← 三方案成本对比 → 维护建议
-  ↓
-[Report]               ← 结构化诊断报告
-  ↓
-[Reflection] ──pass──→ END
-  │                    ↑
-  └──fail──→ [Diagnostic] (最多3次回退)
-```
-
-### 8.2 与系统A的核心区别
-
-| 区别点 | 系统A | 系统B |
-|--------|-------|-------|
-| Agent 实现 | 同步函数 | 异步函数 (async/await) |
-| 数据源 | CSV 文件 | SQLite 数据库 |
-| 传感器维度 | 5 维 | 22 维 |
-| 知识库 | 代码内嵌 17 条 | FMECA表 + NetworkX图 + ChromaDB |
-| LLM 依赖 | ReAct 必须有 LLM | 每个Agent有确定性兜底 |
-| 前端 | 无 | React 完整前端 |
-| 成本分析 | 2 方案（预防vs纠正） | 3 方案（预防vs纠正vs更换） |
-| RUL 输出 | 单点预测 | P10/P50/P90 分位数 |
-| 自验收 | 5 项检查 | 5 项检查（不同维度） |
-
----
-
-## 9. 调优指南
-
-### 9.1 调优入口速查表
-
-| 想调什么 | 改哪个文件 | 改什么 |
-|----------|-----------|--------|
-| 系统A数据源 | `src/config/__init__.py` | `DATA_FILES["machine_logs"]` 路径 |
-| 系统A特征维度 | `src/tools/feature_engineering.py` | `compute_22d_features()` 添加新特征 |
-| 系统A异常检测灵敏度 | `src/tools/algorithms.py` | `zscore_anomaly_detection(threshold=2.5)` |
-| 系统A CUSUM 触发阈值 | `src/tools/algorithms.py` | `cusum_detection(threshold=5.0)` |
-| 系统A故障匹配规则 | `src/config/__init__.py` | `FAULT_MODELS` 列表 |
-| 系统A风险阈值 | `src/agents/diagnosis.py` | `risk_score` 的 0.8/0.6/0.4 阈值 |
-| 系统A成本参数 | `src/agents/decision.py` | `COST_PARAMS` 字典 |
-| 系统A自验收重试次数 | `src/config/__init__.py` | `SYSTEM_CONFIG["max_self_check_retries"]` |
-| 系统A知识库 | `src/agents/rag.py` | `_get_knowledge_base()` 返回的列表 |
-| 系统B异常检测基线 | `src/skills/anomaly_detect.py` | `detect_anomaly()` 中前 40% 数据作基线 |
-| 系统B health_score 阈值 | `src/api/main.py` | severity 判定阈值 (0.45/0.55) |
-| 系统B仿真器参数 | `src/simulator/cnc_simulator.py` | `CNCSimulator` 构造函数 |
-| 系统B故障注入 | `src/simulator/fault_injector.py` | `_SCENARIOS` 字典 |
-| 系统B FMECA 规则 | `src/database/init_db.py` | `FMECA_RULES` 元组 |
-| 系统B LLM 路由 | `src/config/model_routing.py` | `AGENT_ROUTING` 字典（含 `"chat"` 聊天路由） |
-| 系统B 混合检索权重 | `src/knowledge/retrieval.py` | BM25/稠密各自 top_k 与 RRF 融合参数 |
-| 系统B 知识分块粒度 | `src/knowledge/chunking.py` | 各类文档的分块大小与切分规则 |
-| 系统B 工况调制 | `src/data/workload.py` | 班次时间/降载幅度/换刀周期/保养窗口 |
-| 系统B 实时引擎 | `.env` + `src/data/realtime.py` | `REALTIME_ENABLED=1` 开启、`REALTIME_STEP_MINUTES` 步长 |
-| 仿真天数/间隔/设备数 | `src/database/regenerate.py` | `regenerate(days, interval_minutes, n_machines)` |
-
-### 9.2 常见调优场景
-
-#### 场景1：想让系统A检测更灵敏
-
-```python
-# src/tools/algorithms.py
-def zscore_anomaly_detection(data, threshold=1.5):  # 从2.5降到1.5
-    ...
-def cusum_detection(data, threshold=3.0):  # 从5.0降到3.0
-    ...
-```
-
-#### 场景2：想修改系统B的故障注入
-
-```python
-# src/simulator/fault_injector.py
-_SCENARIOS = {
-    "CNC_007": {"fault_code": 1, "start_day": 3, "severity": 0.8},
-    # 添加新设备:
-    "CNC_099": {"fault_code": 5, "start_day": 7, "severity": 0.6},
-}
-```
-
-然后重新生成数据库：
-```bash
-python -m src.database.regenerate
-```
-
-#### 场景3：想让系统B用云端 LLM
+### 3.8 演示前预检（可选）
 
 ```bash
-# .env 文件中添加
-DEEPSEEK_API_KEY=your_api_key_here
-```
-
-系统会自动将 Diagnostic/Prediction/Decision/Report 路由到 DeepSeek API。
-
-#### 场景4：想增加新的故障类型
-
-1. 在 `src/config/__init__.py` 的 `FAULT_MODELS` 中添加新故障定义
-2. 在 `src/database/init_db.py` 的 `FMECA_RULES` 中添加对应的 FMECA 规则
-3. 在 `src/agents/rag.py` 的 `_get_knowledge_base()` 中添加案例知识
-4. 在 `src/simulator/fault_injector.py` 中添加故障注入逻辑
-5. 重新生成数据库：`python -m src.database.regenerate`
-
-#### 场景5：想调整自验收严格程度
-
-```python
-# src/agents/self_check.py (系统A)
-# 或 src/agents/reflection_agent.py (系统B)
-
-# 放宽：只检查关键项（1-4），跳过第5项
-critical_passed = all(c[1] for c in checks[:4])
-# 改为只检查前3项
-critical_passed = all(c[1] for c in checks[:3])
-```
-
-### 9.3 性能优化方向
-
-1. **数据库索引**：`sensor_readings` 表已有 `(machine_id, timestamp DESC)` 索引，查询应走索引
-2. **批量插入**：`regenerate.py` 每 500 条批量插入，可调大批量提升生成速度
-3. **前端按需加载**：22 维趋势图默认显示 3 个指标，用户可按需切换
-4. **LLM 超时**：`client.py` 默认 60 秒超时，网络差时可调大
-5. **异步并发**：系统B全部 async，可配置 `MAX_PARALLEL_DEVICES` 并行分析多台设备
-
-### 9.4 调试技巧
-
-```bash
-# 1. 验证数据库是否正常
-python -c "from src.database.connection import Database; db=Database(); print(db.count('machines'), db.count('sensor_readings'))"
-
-# 2. 验证 Ollama 是否在线
-ollama list
-
-# 3. 验证 API 是否正常
-curl http://localhost:8000/api/overview
-
-# 4. 触发单台设备诊断
-curl -X POST http://127.0.0.1:8000/api/diagnostics/trigger -H "Content-Type: application/json" -d '{"machine_id":"CNC_007"}'
-
-# 5. 查看拓扑图
-curl http://localhost:8000/api/topology | python -m json.tool | head -50
-
-# 6. 系统A单独测试
-python src/main.py --devices CNC_007
+# 只读：复刻生产路径全量跑 100 台，打印「6/6 诊断准确率 + 0/94 健康机误报」
+.venv\Scripts\python.exe scripts/verify_diagnosis_accuracy.py
 ```
 
 ---
 
-## 附录：环境变量说明 (.env)
+## 4. 架构概览
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `DATABASE_URL` | `sqlite:///./data/zhiwei.db` | SQLite 数据库路径 |
-| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 服务地址 |
-| `OLLAMA_MONITOR_MODEL` | `zhiwei-monitor` | 监控Agent使用的本地模型 |
-| `OLLAMA_KNOWLEDGE_MODEL` | `zhiwei-knowledge` | 知识Agent使用的本地模型 |
-| `OLLAMA_REFLECTION_MODEL` | `zhiwei-reflection` | 反思Agent使用的本地模型 |
-| `OLLAMA_EMBEDDING_MODEL` | `bge-m3` | 嵌入模型（ChromaDB用） |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | 通用本地模型（系统A使用） |
-| `DEEPSEEK_API_KEY` | (空) | DeepSeek API密钥（填入后启用云端推理） |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API地址 |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | DeepSeek 模型名 |
-| `MAX_PARALLEL_DEVICES` | `15` | 最大并行分析设备数 |
+### 4.1 分层图
+
+```
+┌───────────────────────── 应用层 ─────────────────────────┐
+│  React 18 + TS + Vite（10 页控制台 + 登录页）             │
+│  FastAPI 51 个接口：49 REST（含 1 SSE）+ 2 WebSocket      │
+│  JWT 认证：viewer 只读 / operator 写 / admin 管理          │
+└───────────────────────────┬──────────────────────────────┘
+                            │ HTTP / WS / SSE
+┌───────────────────── Agent 引擎层 ───────────────────────┐
+│  main_graph（7 节点诊断图）     chat_agent（3 节点聊天图） │
+│  技能层：SkillRegistry + 8 个技能包                        │
+│  知识层：FMECA 9 条 / 因果图 14 节点 / 案例 4 条 / 混合 RAG │
+│  记忆层：会话 / 情节 / 设备画像 / 语义                     │
+│  LLM 层：Ollama（本地）+ DeepSeek（云端），可关            │
+│  自治层：AutonomousLoop + ActivityBus + 通知审批链          │
+└───────────────────────────┬──────────────────────────────┘
+                            │
+┌───────────────────────── 数据层 ─────────────────────────┐
+│  确定性物理仿真器（Paris / Arrhenius / Taylor）           │
+│  工况调制（班次 / 换刀 / 保养窗口）                        │
+│  SQLite(WAL) 14 张表  +  ChromaDB（可选稠密索引）          │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 4.2 主诊断图：7 个节点 + 2 条条件边
+
+```
+START ─▶ monitor ─┬─ 有异常 ─▶ diagnostic ─▶ knowledge ─▶ prediction ─▶ decision ─▶ report ─▶ reflection ─┬─ 通过 ─▶ END
+                  └─ 无异常 ─▶ END                                                                        └─ 不通过 ─▶ diagnostic（最多重试 3 次）
+```
+
+| 节点 | 做什么 |
+| --- | --- |
+| **monitor** | 读最近 240 条读数，用**同侪包络**判据做多信号异常检测，输出健康分 / 异常分 / 异常维度 |
+| **diagnostic** | 算同侪偏差 → 按 7 条规则做故障码隔离 → 构造 E1–E7 证据链 → 算置信度 |
+| **knowledge** | 取 FMECA 规则 + 相似案例 + 因果图**后向溯源**路径 |
+| **prediction** | 威布尔 RUL → P10/P50/P90 三档区间 + 退化率 + 动态监测频率 |
+| **decision** | 三方案成本对比（立即维修 / 计划窗口 / 减载运行 20%）→ 推荐总成本最低者 |
+| **report** | 纯确定性 Markdown 拼装（不调用大模型） |
+| **reflection** | 5 项质量门（数据完整性 / 逻辑一致性 / 证据链闭合 / 预测合理性 / 物理约束）→ 通过放行，否则回退重诊 |
+
+两条条件边的精确判定：
+
+```python
+route_monitor    → "diagnostic" if is_anomaly 且无 error else "end"
+route_reflection → "end" if 自检通过 或 重试次数已达上限(3) else "retry"（回 diagnostic）
+```
+
+### 4.3 聊天图：3 个节点
+
+```
+classify ─▶ dispatch ─▶ compose ─▶ END
+```
+
+| 节点 | 做什么 |
+| --- | --- |
+| **classify** | 规则优先的意图分类（6 类：`machine_info` / `machine_sop` / `machine_records` / `knowledge_search` / `general` / `chitchat`），抽出 `CNC_078` 形式的设备号；仅在规则未打准且云端可用时才让 LLM 兜底 |
+| **dispatch** | 走**确定性** SQL / RAG 取数据（不依赖 LLM） |
+| **compose** | 让 LLM 把工具结果组织成人话；LLM 不可用时用模板兜底，**聊天窗口永远有答案** |
+
+分工原则：**主图产生结论，聊天图解释结论**——聊天图不参与任何判定。
+
+### 4.4 依赖注入与检查点
+
+`build_graph(database, fault_graph)` 用闭包把仓储层与因果图注入节点包装函数，节点自身保持「只依赖 State」的纯函数形态。图以 `MemorySaver` 编译，按 `thread_id` 保存中间状态——`POST /api/diagnostics/stream` 正是靠它把每个节点的中间状态以 SSE 推给前端的推理控制台。
+
+---
+
+## 5. 数据从哪来
+
+### 5.1 规模
+
+| 项 | 值 |
+| --- | --- |
+| 数据库文件 | `data/zhiwei.db`，约 **62.25 MB** |
+| 业务表 | **14 张** |
+| 设备 | **100 台**（LINE-01 ~ LINE-05，各 20 台） |
+| 遥测读数 | **67202 条**（100 × 14 天 × 48 步/天 + 2 条实时 tick） |
+| 时间范围 | `2025-07-01 00:00` → `2025-07-15 00:00` |
+| 采样间隔 | 30 分钟 |
+| 每条读数维度 | **22 维** |
+| 注入故障设备 | **6 台 / 100 台**（6%） |
+
+### 5.2 14 张表
+
+| 表 | 行数 | 说明 |
+| --- | --- | --- |
+| `machines` | 100 | 设备主数据 |
+| `sensor_readings` | 67202 | 22 维遥测时序 |
+| `users` | 1 | 登录账号（用户名 / 口令哈希 / 角色） |
+| `fmeca_rules` | 9 | 结构化故障规则（fault_code 1–9） |
+| `case_library` | 4 | 历史案例 |
+| `diagnostics` | 87 | 诊断快照 |
+| `maintenance_records` | 45 | 维护工单 |
+| `notifications` | 45 | 待审 / 已审通知 |
+| `agent_activity` | 460 | Agent 行为审计 |
+| `conversation_threads` / `conversation_messages` | 5 / 42 | 会话记忆 |
+| `long_term_memory` | 1 | 长期记忆 |
+| `maintenance_reports` | 3 | 维护报告 |
+| `data_provenance` | 2 | 数据血缘 |
+
+### 5.3 数据怎么生成的
+
+**① 确定性物理退化模型**（`src/simulator/physics_models.py`，无随机数）
+
+| 模型 | 用途 |
+| --- | --- |
+| Paris 裂纹扩展 | 轴承磨损：`crack = 0.02 + 1e-5 × cycles × stress³`，按 0.25 归一 |
+| Arrhenius 热老化 | 电机绝缘：以 70℃ 为锚点的相对老化速率 |
+| Taylor 刀具寿命 | 刀具磨损：`life = 200 × (v/f)^-0.25 / 硬度因子` |
+
+仪表噪声用**双频正弦叠加**代替随机采样：`scale × (0.65×sin(step×0.071) + 0.35×sin(step×0.013+1.7))`，同一 `step` 必然得到同一个值。
+
+**② 8 个基线参数 → 22 维遥测**（`src/simulator/sensor_models.py`）
+
+仿真器内部维护 **8 个基线参数**（温度 / 电流 / 电压 / 转速 / 振动 / 冷却水温 / 冷却压力 / 油压），按机号确定性漂移；再由**传感器传递函数**派生出 **22 维遥测**（含 `motor_power`、`spindle_load`、`bearing_temp` 等派生量）。故障设备按 `强度 = 渐进曲线 × 严重度` 在同一套公式上叠加征兆。
+
+**③ 6 类注入故障**（`src/simulator/fault_injector.py`）
+
+| 设备 | 故障 | onset 天 | 前兆天数 | 严重度 |
+| --- | --- | --- | --- | --- |
+| CNC_007 | 电源模块故障 | 3.0 | 2.0 | 0.80 |
+| CNC_018 | 轴承磨损 | 5.0 | 3.0 | 0.85 |
+| CNC_025 | 温度过高 | 7.0 | 2.0 | 0.70 |
+| CNC_036 | 散热系统故障 | 4.0 | 2.0 | 0.75 |
+| CNC_052 | 电机过载 | 9.0 | 2.5 | 0.65 |
+| CNC_078 | 转子故障 | 10.0 | 3.0 | 0.75 |
+
+> ⚠️ **数据为仿真生成，不是真实产线数据。** 所有准确率表述都应理解为「在已知真值的仿真数据上的自测口径」。详见第 9 章。
+
+### 5.4 实时推进（默认关闭）
+
+`RealtimeEngine`（`src/data/realtime.py`）按真实时钟每 **5 秒**把每台设备推进 **30 分钟**的仿真时间，追加**带工况调制**的新读数。时钟游标三级恢复（`data/sim_clock.json` → 数据库 `MAX(timestamp)` → 启动时刻），保证只追加、不改写历史；每 10 拍写一条数据血缘记录。开启方式见第 8 章。追加读数的 `health_score` 为空（仿真器不产出该字段），健康分按中性 0.8 处理，详见第 9 章第 10 条。
+
+---
+
+## 6. 目录结构导览
+
+### 6.1 `src/` —— 14 个子目录（89 个 .py）
+
+| 目录 | 职责 | 关键文件 |
+| --- | --- | --- |
+| `src/` | 全局单点 | `severity.py`（**严重度唯一口径**）· `main.py`（CLI 入口，教学版）· `state.py`（教学版状态类） |
+| `agents/` | 智能体节点 | `state.py`（`DiagnosticState` 26 字段）· `monitor_agent.py` · `diagnostic_agent.py` · `knowledge_agent.py` · `prediction_agent.py` · `decision_agent.py` · `report_agent.py` · `reflection_agent.py` · `chat_agent.py` · `autonomous_loop.py` |
+| `api/` | HTTP 服务 | `main.py`（51 个接口 + lifespan + trace 中间件）· `security.py`（**JWT 认证 / 三角色依赖 / WS 令牌校验**） |
+| `config/` | 配置 | `__init__.py`（路径 / 22 维列名 / 认证与管理员配置 / 教学版常量）· `model_routing.py`（LLM 路由表 + 提示词框架） |
+| `data/` | 数据链路 | `workload.py`（工况调制）· `realtime.py`（实时推进引擎） |
+| `database/` | 仓储层 | `connection.py`（14 张表 DDL + 查询，含 `users` 表与账号 CRUD）· `schemas.py` · `init_db.py`（FMECA 9 条 / 案例 4 条）· `regenerate.py`（**全量重建**） |
+| `graph/` | 图定义 | `main_graph.py`（**主诊断图**）· `edges.py` · `build.py`（教学版 8 节点图） |
+| `knowledge/` | 知识层 | `fault_graph.py`（因果图 14 节点）· `chunking.py`（结构感知分块）· `retrieval.py`（BM25 + 稠密 + RRF）· `index_builder.py`（108 chunk 索引） |
+| `llm/` | LLM 客户端 | `client.py`（`UnifiedLLMClient`：chat / embed / health_check / parse_json） |
+| `memory/` | 记忆 | `manager.py`（`MemoryManager` 门面） |
+| `observability/` | 可观测性 | `logger.py`（3 份日志 + trace 传播 + 读取 API） |
+| `simulator/` | 仿真器 | `physics_models.py` · `sensor_models.py`（22 维传递函数）· `fault_injector.py` · `cnc_simulator.py` |
+| `skills/` | 技能层 | `base.py`（`BaseSkill` / `SkillMeta` / **`SkillRegistry`**）+ 8 个子包 |
+| `tools/` | 教学版工具 | `algorithms.py` · `data_loader.py` · `feature_engineering.py` · `type_converter.py` |
+
+**8 个技能子包**（每个 = `__init__.py` + `skill.py` + `schema.py` + `SKILL.md`）：
+
+| id | 分类 | 作用 |
+| --- | --- | --- |
+| `anomaly_detect` | analysis | 同侪包络 + 阈值 + 趋势的三信号异常检测 |
+| `rul_weibull` | prediction | 威布尔 RUL → P10/P50/P90 |
+| `evidence_chain` | analysis | E1–E7 证据链 + 加权聚合置信度 |
+| `cost_benefit` | operations | 三方案成本对比 + What-if |
+| `case_match` | knowledge | 案例库词法检索 |
+| `fault_graph_trace` | analysis | 因果图 forward / backward 遍历 |
+| `diagnostic_report` | report | 确定性 Markdown 报告 |
+| `maintenance_report` | operations | 审批后生成维护报告并落库 |
+
+### 6.2 `scripts/` —— 9 个脚本
+
+| 脚本 | 说明 |
+| --- | --- |
+| `verify_diagnosis_accuracy.py` | **只读** 演示前预检：6/6 诊断 + 0/94 误报 |
+| `audit_artifact_consistency.py` | **只读** 审计「真值 vs 诊断 vs 待审通知 vs 报告」一致性 |
+| `rag_tools.py build\|eval` | 构建 / 评估知识索引（recall@5） |
+| `repair_data.py`（`--dry-run`） | 回填缺失的 `health_score`，幂等 |
+| `repair_chat_chitchat_answers.py`（`--dry-run`） | 清洗历史会话里「检索原文冒充答案」的助手回复 |
+| `fix_stale_notifications.py`（`--dry-run`） | 修正待审通知里写错的故障名（保留审批状态） |
+| `recompute_fault_readings.py` | **定向**重算指定设备读数（自动备份整库） |
+| `refresh_fault_diagnosis.py` | 重跑指定设备诊断并重建其维护报告 |
+| `_doc_facts.py` | **只读** 输出文档所需的全部实测数字 |
+
+> 所有脚本都必须用项目 venv 运行：`.venv\Scripts\python.exe scripts/xxx.py`。
+> **局部重算绝不要用 `src/database/regenerate.py`**——它会 `unlink` 整个库文件；用 `recompute_fault_readings.py`。
+
+### 6.3 `web/` —— 前端
+
+| 路径 | 职责 |
+| --- | --- |
+| `src/App.tsx` | 应用外壳：侧栏 + 顶栏 + 10 页条件渲染（**无 react-router**，用 `useState<Page>`）；登录守卫与角色下发 |
+| `src/api.ts` / `src/types.ts` | 接口封装（自动注入 `Authorization` 头、401 广播登出）/ TS 类型 |
+| `src/auth.tsx` | 登录态上下文：token 持久化、启动验活、角色判定（`canWrite` / `canAdmin`） |
+| `src/pages/login.tsx` | 登录页 |
+| `src/pages/fleet.tsx` | `OverviewPage` · `MachinesPage` |
+| `src/pages/agents.tsx` | `DiagnosticsPage` · `AgentMonitorPage` |
+| `src/pages/chat.tsx` | `ChatPage` · `ReportsPage` · `LogsPage` |
+| `src/pages/knowledge.tsx` | `KnowledgePage` · `TopologyPage` · `OperationsPage` |
+| `src/components/ui.tsx` | 13 个通用原子组件（`RiskBadge` / `HealthBar` / `EvidenceChain` / `DecisionPanel` …） |
+| `src/components/charts.tsx` | `Sparkline` / `MiniBar` 迷你图（主题感知） |
+| `src/theme.ts` | 浅色 / 暗色主题切换 + 图表调色板 |
+| `src/reportExport.ts` | Markdown → HTML **单一转换器**，MD / Word / 打印三种导出共用 |
+| `src/TrendChart.tsx` | echarts 趋势图（22 维中文名映射） |
+| `src/styles.css` | 设计系统（CSS 变量令牌 / 侧栏 232px / 内容 1280px / 1px 边框 / radius 10px） |
+
+### 6.4 `data/` 与 `docs/`
+
+| 路径 | 内容 |
+| --- | --- |
+| `data/zhiwei.db` | SQLite 主库 |
+| `data/knowledge/*.txt` | 4 份工程文档：维护手册 / 设备说明书 / 案例知识库 / 设备成本与产量 |
+| `data/index/` | `bm25.pkl` · `chunks.json` · `fingerprint.json` |
+| `data/chroma_db/` | Chroma 稠密索引（可选） |
+| `data/logs/` | `app.log` · `llm_audit.jsonl` · `tool_calls.jsonl` |
+| `data/raw/` | 竞赛 CSV（教学版数据源） |
+| `docs/` | 架构与教学文档、`zhiwei-submit/`（单文件提交版 Demo）、`archive/` |
+
+---
+
+## 7. 接口与前端速览
+
+### 7.1 接口总数：51
+
+| 类别 | 数量 |
+| --- | --- |
+| REST 业务接口 | **49**（含 1 个 SSE：`POST /api/diagnostics/stream`） |
+| WebSocket | **2**（`/ws/realtime`、`/ws/agent`） |
+| 合计 | **51** |
+
+> 不含 FastAPI 自动生成的 `/docs`、`/openapi.json` 等文档路由。
+
+### 7.2 分组要点
+
+| 分组 | 接口数 | 代表接口 |
+| --- | --- | --- |
+| 系统 | 2 | `GET /health` |
+| 认证 | 4 | `POST /api/auth/login` · `GET /api/auth/me` · `GET/POST /api/auth/users` |
+| 总览与设备 | 6 | `GET /api/overview` · `POST /api/diagnostics/trigger` |
+| 诊断 | 3 | `POST /api/diagnostics/stream`（SSE 流式） |
+| 知识 | 4 | `POST /api/knowledge/search`（混合检索）· `GET /api/topology` |
+| 运维工单 | 2 | `POST /api/operations/orders` |
+| Agent 自治 | 7 | `POST /api/agent/scan` · `POST /api/notifications/{id}/review`（审批联动） |
+| 可观测 | 5 | `GET /api/logs/trace/{trace_id}`（按 trace 聚合全链路） |
+| 技能 | 3 | `GET /api/skills` · `POST /api/skills/{id}/run` |
+| 聊天 | 3 | `POST /api/chat` |
+| 记忆 | 4 | `POST /api/memory/profile/{machine_id}/refresh` |
+| 维护报告 | 3 | `POST /api/reports/{id}/push`（飞书 / 企业微信 / 钉钉） |
+| 数据层 | 3 | `GET /api/data/provenance` |
+
+### 7.3 前端 10 个页面
+
+| # | 页面 | 页面内能做什么 |
+| --- | --- | --- |
+| — | **登录页** | 用户名 + 密码登录，角色权限说明 |
+| 1 | **总览** | 全厂 KPI 卡片（含健康分布直方图与产线迷你图）、健康矩阵、产线筛选、最近诊断与工单 |
+| 2 | **设备** | 设备列表与健康条、单机详情、历史趋势图 |
+| 3 | **诊断中心** | 手动触发诊断、SSE 实时推理时间线、证据链与决策面板 |
+| 4 | **智能问答** | 多会话聊天、引用来源卡片、新建对话 |
+| 5 | **维护报告** | 报告列表与预览、导出 MD / Word / 打印存 PDF、IM 推送 |
+| 6 | **Agent 监控** | WebSocket 实时活动流、自主循环开关、待审通知与审批 |
+| 7 | **运行日志** | 应用日志 / LLM 审计 / 工具调用三个视图，10 秒自动刷新 |
+| 8 | **关联图谱** | 设备 → 产线 → 故障因果图（含边概率） |
+| 9 | **知识库** | FMECA 规则折叠表、案例卡片、混合检索实验台 |
+| 10 | **运维工单** | 工单列表与人工建单 |
+
+前端特性：全局数据流在 `App.tsx` 统一拉取 `overview` + `machines`，通过 `ws://127.0.0.1:8000/ws/realtime` 推送触发刷新；侧栏「Agent 监控」带**待审通知数量徽标**（10 秒轮询）；浅色 / 暗色双主题（`data-theme` + localStorage 持久化）；页面级错误边界防止单页异常白屏。
+
+### 7.4 登录认证与三角色
+
+| 项 | 说明 |
+| --- | --- |
+| 登录 | `POST /api/auth/login`（用户名 + 密码 → JWT，HS256） |
+| 令牌使用 | 后续请求带 `Authorization: Bearer <token>`；WebSocket 用查询参数 `?token=<token>`（浏览器无法给 WS 设请求头） |
+| 当前用户 | `GET /api/auth/me`（前端启动验活与路由守卫用） |
+| 账号管理 | `GET / POST /api/auth/users`（仅管理员）：列出 / 创建账号 |
+| 口令存储 | pbkdf2_sha256 加盐哈希（随机盐），不依赖 passlib / bcrypt |
+| 初始管理员 | 后端启动时幂等播种，凭据取自 `.env` 的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` |
+| 有效期 | 由 `JWT_EXPIRE_MINUTES` 控制；过期后前端收到 401 自动登出回登录页 |
+
+三角色权限矩阵（与后端依赖注入一一对应，49 个 REST 接口 + 2 个 WS 通道全覆盖）：
+
+| 能力 | viewer | operator | admin |
+| --- | :---: | :---: | :---: |
+| 全部读接口（总览 / 设备 / 诊断 / 知识 / 日志 / 报告 / 聊天 / 记忆 / 工单） | ✓ | ✓ | ✓ |
+| 触发诊断、SSE 推理、立即扫描、通知审批、新建工单、写记忆、跑技能 | — | ✓ | ✓ |
+| 推送报告、删除记忆、账号管理、自主循环开关、手动 tick | — | — | ✓ |
+
+前端行为：未登录渲染登录页（主界面完全不挂载，WS 与轮询自然停止）；写按钮按角色禁用并提示所需角色；顶栏展示当前用户与角色徽标，可一键退出。
+
+新增角色账号（管理员）：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/users \
+  -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
+  -d '{"username":"operator1","password":"<至少6位>","role":"operator"}'
+```
+
+---
+
+## 8. 常用配置速查
+
+所有变量写在项目根目录的 `.env`（从 `.env.example` 复制）。**修改后需重启后端。**
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./data/zhiwei.db` | 数据库地址（仅支持 SQLite） |
+| `DATA_DIR` | `data/raw` | 数据目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+| `MAX_PARALLEL_DEVICES` | `15` | 并行分析设备数上限 |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | 本地 Ollama 地址 |
+| `OLLAMA_MONITOR_MODEL` | `qwen2.5:7b` | monitor 节点的本地模型 |
+| `OLLAMA_KNOWLEDGE_MODEL` | `qwen2.5:7b` | knowledge / chat 节点的本地模型 |
+| `OLLAMA_REFLECTION_MODEL` | `qwen2.5:7b` | reflection 节点的本地模型 |
+| `OLLAMA_EMBEDDING_MODEL` | `bge-m3` | 嵌入模型（1024 维） |
+| `DEEPSEEK_API_KEY` | （空） | **留空也能跑**：自动降级为本地 / 规则模式 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek 地址 |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | 云端模型名 |
+| **`AUTH_SECRET`** | （空则每次启动随机） | JWT 签名密钥；显式设置可保证重启后已签发令牌继续有效 |
+| **`JWT_EXPIRE_MINUTES`** | `720` | 令牌有效期（分钟） |
+| **`ADMIN_USERNAME`** | `admin` | 初始管理员用户名（首次启动幂等播种） |
+| **`ADMIN_PASSWORD`** | （必填建议） | 初始管理员密码（首次启动播种，建议修改） |
+| **`AUTONOMOUS_LOOP_ENABLED`** | `0` | `1` = 每 30 秒自动扫描全厂、自动诊断与派单（会消耗 token） |
+| **`REALTIME_ENABLED`** | `0` | `1` = 按仿真时钟持续追加新读数 |
+| `REALTIME_STEP_MINUTES` | `30` | 每次推进的仿真时间（分钟） |
+| `REALTIME_TICK_SECONDS` | `5.0` | 真实推进间隔（秒） |
+| `OFFLINE_LAG_MINUTES` | `120` | 离线判定阈值：读数落后全厂最新时间超过它才算离线 |
+| `REPORT_WEBHOOK_URL` | （空） | 报告推送的群机器人地址（留空则页面内填写） |
+| `REPORT_WEBHOOK_TYPE` | `feishu` | 推送渠道：`feishu` / `wecom` / `dingtalk` |
+| `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | 允许的前端来源 |
+| `ENABLE_LLM_ENRICHMENT` | `0` | `1` = 开启诊断节点的 LLM 候选校验（默认全确定性） |
+
+**运行时开关**（不用改 `.env`、不用重启；除登录外均需令牌，角色见第 7.4 节）：
+
+```bash
+# 1) 登录换取 JWT（用户名密码见 .env 的 ADMIN_USERNAME / ADMIN_PASSWORD）
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<你的密码>"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+# 2) 带令牌调用管理级接口
+# 开启 / 关闭自主循环（admin）
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/agent/loop/toggle"
+# 强制立即扫描一次（operator 及以上）
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/agent/scan"
+# 手动推进一拍实时数据（admin）
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/data/realtime/tick"
+```
+
+> 更细的「想调什么 → 改哪个文件 → 改什么」清单（覆盖仿真参数、故障注入、异常阈值、隔离规则、RUL 系数、成本常量、分块参数、检索权重、工况节律、记忆去重等 **40+ 项**）见 `项目详细报告.md` 附录 C。
 
 ---
 
-_本 README 由 WorkBuddy 生成，基于对项目全部源码的逐文件分析。_
+## 9. 系统边界与客观局限
+
+以下是系统当前的实际边界，每条给出一句「因此……」，帮助正确解读它的输出。
+
+| # | 事实 | 因此 |
+| --- | --- | --- |
+| 1 | **数据由物理仿真器生成，不是真实产线数据** | 67202 条读数全部由 Paris / Arrhenius / Taylor 三个模型 + 确定性噪声产生，故障由预设场景注入；展示的是「在已知真值下算法链路能否正确工作」的验证结果，**不能**用来推断真实产线准确率 |
+| 2 | **未接真实设备 / MES / 工单系统** | 没有 OPC UA / MQTT / Modbus 采集层，工单与通知只写在本地表里，不会真正下发到外部系统 |
+| 3 | **认证为单机演示级** | JWT 三角色覆盖全部 49 个 REST 接口与 2 个 WS 通道，口令加盐哈希；但无多租户、无登录审计、无密码策略与锁定机制。定位仍是**单机部署的内部演示与验证平台**，不能直接暴露到公网 |
+| 4 | **LLM 默认关闭，关闭时如何运行** | `ENABLE_LLM_ENRICHMENT=0` + DeepSeek Key 留空 + Ollama 未启动时，全链路仍可完整运行：诊断 / 预测 / 决策 / 报告 / 自检全是本地确定性算法，聊天走模板兜底（`llm_used=false`） |
+| 5 | **单机 SQLite，非分布式** | 存储是单文件库 + 本地 pickle / Chroma 目录，自治循环与实时引擎都是进程内协程；不支持多实例水平扩展 |
+| 6 | **历史库不含工况节律** | 工况调制只在 `RealtimeEngine`（默认关）生效，`data/zhiwei.db` 里的 67202 条读数是「恒定负荷下的退化曲线」，看不到夜班降载、换刀窗口、周三保养等现象 |
+| 7 | **`health` 缺失 ≠ 设备离线** | 健康分缺失时按中性基线 `0.8` 处理（视为在运行）；「离线」只由读数新鲜度决定（落后全厂最新 > 120 分钟）。判断数据是否新鲜应看 `latest_reading.timestamp` |
+| 8 | **RAG 知识源仅 4 类文档 + 3 张表** | 索引共 108 个 chunk；`recall@5 = 0.917`（11/12）是对 **12 条预置查询**的评测结果，唯一未命中的是知识库未覆盖的业务指标类问题，不代表开放域问答能力 |
+| 9 | **自主循环与实时引擎默认关** | 默认启动态是「静态数据 + 手动触发」；「数据在往前走」与「无人值守自动派单」需要显式开启环境变量或调用运行时开关 |
+| 10 | **实时 tick 追加的读数不带健康分** | `RealtimeEngine` 追加读数的 `health_score` 为空（仿真器输出不含该字段），健康分按中性 `0.8` 处理；实时引擎默认关闭，手动 tick 为演示路径，正式演示前建议以 `verify_diagnosis_accuracy.py` 复核 |
+
+### 演进方向
+
+| 方向 | 含义 |
+| --- | --- |
+| 接真实数据源 | 在 `src/data/` 新增采集适配层（OPC UA / MQTT / Modbus），把 `RealtimeEngine.tick()` 的数据来源从仿真器换成现场网关，`SensorReading` 契约不变 |
+| 认证增强 | 在现有 JWT 三角色基础上加 `tenant_id`、登录审计与密码策略，`reviewer` 从令牌解析而非表单输入 |
+| 时序库与分布式 | 把 `sensor_readings` 迁到 TimescaleDB / InfluxDB，`AutonomousLoop` 拆成独立 worker |
+| 工况重放与在线学习 | 用真实工况日志重放让历史库带上节律；用现场标注数据校准隔离规则的 12 个阈值与包络常数 |
+| 知识图谱动态化 | 让因果图从 FMECA 表与现场工单自动生成 / 更新边权，而不是硬编码 12 条边 |
+| 模型自校准 | 用维修回填结果反向评估 RUL 与诊断准确率，形成闭环 |
+| 能力外露与 MCP 接入 | 8 个技能已通过 `to_langchain_tool()` 暴露为工具，可进一步包装成 MCP Server 供外部 Agent 调用 |
 
 ---
 
 ## 10. 文档导航
 
-| 文档 | 内容 | 何时读 |
-|---|---|---|
-| **`项目详细报告.md`** | 逐模块"做了什么 / 怎么做 / 关键文件 / 验证"，含第 15 章 8 项改造记录、第 16 章验收后补齐 | 快速了解全貌 / 汇报 |
-| **`docs/项目技术教学详解.md`** | 老师讲解式长讲义：LangGraph 图编排 / RAG / Skill / Tool / ReAct / 三种 Loop / 模型调用与调优 / 上下文工程 / 四层记忆 / MCP 与 Harness，含自查练习 | **想真正学会在 LangGraph 下搭智能体时读它** |
-| **`docs/ARCHITECTURE.md`** | 新架构分层图 + 三条 LangGraph 图 + 50 端点 + 数据层断点续写 | 快速定位架构与文件 |
-| **`docs/`(其余)** | AGENTS.md / PROJECT_MASTER.md / 问题日志 / LangGraph 学习解析 / 归档 | 历史与协作约定 |
+| 文档 | 内容 |
+| --- | --- |
+| **`项目详细报告.md`** | 全量技术详解：逐模块、逐算法、带常数与代码片段（21 章 + 3 个附录），含**调优入口速查表** |
+| `LICENSE` | MIT 许可 |
+| `docs/ARCHITECTURE.md` | 架构说明 |
+| `docs/AGENTS.md` | 智能体设计说明 |
+| `docs/项目技术教学详解.md` | 教学向解读 |
+| `docs/LangGraph智能体学习解析.md` | LangGraph 概念讲解 |
+| `docs/PROJECT_MASTER.md` | 项目主文档 |
+| `docs/zhiwei-submit/` | 单文件提交版 Demo（`index.html` + `api.py`） |
 
-运行回归测试：
+**常用命令**
 
 ```bash
-.venv/Scripts/python.exe -m pytest tests/ -q        # 15 passed ~1s（纯函数+确定性路径，不触网）
+# 全量重建数据库（会删除并重新生成 data/zhiwei.db，首次 clone 才需要）
+.venv\Scripts\python.exe -m src.database.regenerate
+
+# 跑测试
+.venv\Scripts\python.exe -m pytest tests/ -q
+
+# 演示前预检（只读）
+.venv\Scripts\python.exe scripts/verify_diagnosis_accuracy.py
+
+# 构建 / 评估知识索引
+.venv\Scripts\python.exe scripts/rag_tools.py build
+.venv\Scripts\python.exe scripts/rag_tools.py eval
+
+# 启动后端（必须用 127.0.0.1）
+.venv\Scripts\uvicorn src.api.main:app --host 127.0.0.1 --port 8000
+
+# 启动前端
+cd web && npm run dev
 ```
-
-> `docs/archive/` 仅做历史保留（含 4 份去重后的知识源快照、3 份改造前规划文档），运行期不读取。
-

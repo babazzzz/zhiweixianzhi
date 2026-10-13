@@ -14,7 +14,7 @@ venv/
 .env.local
 
 # Data (large files)
-data/raw/*.csv
+# data/raw/*.csv 不忽略：bootstrap_database 依赖这 4 个源 CSV（与 docs/zhiwei-submit/data/ 内副本一致）
 data/raw/*.xlsx
 
 # Logs
@@ -64,6 +64,12 @@ error_screenshot.png
 # 课程/个人文档（含姓名学号等隐私，不入库）
 *.docx
 *.html
+
+# 个人音视频材料压缩包（系统介绍视频与截图等，不入库）
+*.zip
+
+# 文档本地备份（README.md.bak / 项目详细报告.md.bak 等，勿提交）
+*.bak
 
 # 数据库本地备份（可由当前库复现，勿提交）
 data/zhiwei.db.bak*
