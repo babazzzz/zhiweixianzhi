@@ -267,7 +267,21 @@ async def health() -> dict[str, object]:
 
     database = get_database()
     from src.llm.client import UnifiedLLMClient
-    return {"status": "ok", "database": {"machines": database.count("machines"), "readings": database.count("sensor_readings"), "diagnostics": database.count("diagnostics")}, "llm": await UnifiedLLMClient(timeout_seconds=4.0).health_check()}
+    # 知识索引状态：只读取已加载的检索器，不触发索引构建或嵌入调用。
+    # Agent 尚未创建时只报 loaded:false，避免健康检查把整个索引拖起来。
+    rag: dict[str, object] = {"loaded": False}
+    agent = getattr(app.state, "chat_agent", None)
+    if agent is not None:
+        try:
+            rag = {"loaded": True, **agent.index_retriever().stats()}
+        except Exception as error:  # noqa: BLE001 - 健康检查不应因索引异常而失败
+            rag = {"loaded": True, "error": f"{type(error).__name__}: {error}"}
+    return {
+        "status": "ok",
+        "database": {"machines": database.count("machines"), "readings": database.count("sensor_readings"), "diagnostics": database.count("diagnostics")},
+        "llm": await UnifiedLLMClient(timeout_seconds=4.0).health_check(),
+        "rag": rag,
+    }
 
 
 # ============================================================================
