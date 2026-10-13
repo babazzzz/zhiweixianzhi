@@ -4,7 +4,7 @@
 > 后端 FastAPI + SQLite，前端 React 18，数据由确定性物理仿真器驱动。
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009485?logo=fastapi&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009485?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1C3C3C)
 ![Tests](https://img.shields.io/badge/tests-44%20passed-brightgreen)

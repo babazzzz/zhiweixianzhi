@@ -154,13 +154,16 @@ export function LogsPage(): JSX.Element {
       <div className="log-table">
         <div className="log-row head"><span>时间</span><span>级别</span><span>组件</span><span>Trace</span><span>内容</span></div>
         {items.length === 0 && <Empty label="暂无日志。触发一次诊断或提问后再来看。" />}
-        {items.map((item, index) => <div key={index} className={`log-row level-${String(item.level ?? "INFO").toLowerCase()}`}>
-          <span>{String(item.ts ?? "").slice(11, 23)}</span>
-          <span><i className={`tag ${String(item.level).toLowerCase()}`}>{String(item.level ?? "")}</i></span>
-          <span>{String(item.component ?? "")}</span>
-          <code>{String(item.trace_id ?? "").slice(0, 8)}</code>
-          <span className="log-message">{String(item.message ?? JSON.stringify(item))}</span>
-        </div>)}
+        {items.map((item, index) => {
+          const message = String(item.message ?? JSON.stringify(item));
+          return <div key={index} className={`log-row level-${String(item.level ?? "INFO").toLowerCase()}`}>
+            <span>{String(item.ts ?? "").slice(11, 23)}</span>
+            <span><i className={`tag ${String(item.level).toLowerCase()}`}>{String(item.level ?? "")}</i></span>
+            <span>{String(item.component ?? "")}</span>
+            <code>{String(item.trace_id ?? "").slice(0, 8)}</code>
+            <span className="log-message" title={message}>{message}</span>
+          </div>;
+        })}
       </div>
       <p className="muted">落盘位置：<code>data/logs/app.log</code>（应用日志）、<code>data/logs/llm_audit.jsonl</code>（每次 LLM 调用的模型/耗时/Token）、<code>data/logs/tool_calls.jsonl</code>（每次 Skill/工具调用与参数）。报错时把 Trace-ID 贴进上面输入框即可看到完整调用链。</p>
     </section>
