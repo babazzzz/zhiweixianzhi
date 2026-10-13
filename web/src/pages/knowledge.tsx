@@ -208,12 +208,14 @@ export function KnowledgePage(): JSX.Element {
   const [rules, setRules] = useState<Rule[]>([]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<{ fmeca: Rule[]; cases: CaseItem[]; chunks: HybridChunk[] } | null>(null);
+  const [searched, setSearched] = useState("");
   const [expandedChunk, setExpandedChunk] = useState<string | null>(null);
   useEffect(() => { void api.fmeca().then(setRules).catch(() => setRules([])); }, []);
   const search = async (): Promise<void> => {
     if (!query.trim()) return;
     const response = await api.search(query) as { fmeca: Rule[]; cases: CaseItem[]; chunks?: HybridChunk[] };
     setResults({ fmeca: response.fmeca ?? [], cases: response.cases ?? [], chunks: response.chunks ?? [] });
+    setSearched(query);
   };
   return <>
     <section className="panel search-panel">
@@ -224,9 +226,9 @@ export function KnowledgePage(): JSX.Element {
         <button className="button primary" onClick={() => void search()}>检索</button>
       </div>
     </section>
-    {results && results.chunks.length > 0 && <section className="panel">
+    {results && <section className="panel">
       <PanelTitle title={`混合检索结果 (${results.chunks.length})`} />
-      <div className="chunk-list">{results.chunks.map((chunk) => {
+      {results.chunks.length ? <div className="chunk-list">{results.chunks.map((chunk) => {
         const expanded = expandedChunk === chunk.id;
         return <article key={chunk.id} className="chunk-item">
           <header><span className="tag">{chunk.doc_type}</span><strong>{chunk.section?.join(" › ") ?? chunk.source}</strong><em>RRF {chunk.score.toFixed(4)}</em></header>
@@ -236,7 +238,7 @@ export function KnowledgePage(): JSX.Element {
           </button>}
           <small>BM25 排名 {chunk.bm25_rank ?? "—"} · 向量排名 {chunk.dense_rank ?? "—"}</small>
         </article>;
-      })}</div>
+      })}</div> : <Empty label={`没有召回与「${searched}」相关的知识片段。可换用参数名或故障名提问，例如「电流异常升高」「温度升高 电流正常」。`} />}
     </section>}
     {results && <div className="two-column">
       <section className="panel"><PanelTitle title="匹配 FMECA 规则" />{results.fmeca.length ? <RulesTable rules={results.fmeca} /> : <Empty label="没有命中结构化规则。" />}</section>

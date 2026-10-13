@@ -44,6 +44,7 @@ FINGERPRINT_PATH = INDEX_DIR / "fingerprint.json"
 DOCUMENT_SOURCES: tuple[tuple[str, str], ...] = (
     ("维护手册.txt", "manual"),
     ("设备说明书.txt", "spec"),
+    ("故障征兆判读指引.txt", "guide"),
     ("案例知识库.txt", "case"),
     ("设备成本与产量.txt", "cost"),
 )

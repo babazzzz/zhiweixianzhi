@@ -71,6 +71,8 @@ SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
     ("编码器", "码盘", "encoder"),
     ("停机", "急停", "断电", "downtime"),
     ("维修", "检修", "维护", "保养", "maintenance"),
+    ("产量", "日产量", "日产", "产能", "产出", "units produced", "output"),
+    ("成本", "单位生产成本", "成本高", "unit cost"),
     ("故障", "异常", "失效", "fault", "failure"),
 )
 
@@ -86,7 +88,8 @@ class DocumentChunk:
     id: str
     text: str
     source: str
-    #: 文档类型：manual（维护手册）/ spec（设备说明书）/ case（案例库）/ fmeca（规则库）/ cost（成本产量）
+    #: 文档类型：manual（维护手册）/ spec（设备说明书）/ guide（征兆判读指引）/
+    #: case（案例库）/ fmeca（规则库）/ cost（成本产量）
     doc_type: str
     #: 标题路径，如 ["维护手册", "故障类型1：轴承磨损", "标准维修步骤"]
     section_path: list[str] = field(default_factory=list)

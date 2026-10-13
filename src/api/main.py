@@ -470,12 +470,17 @@ async def knowledge_search(request: KnowledgeSearchRequest, _: CurrentUser) -> d
     """Hybrid knowledge search: BM25 + bge-m3 dense fused with RRF, plus FMECA/case results."""
 
     database = get_database()
-    rules = [rule for rule in database.list_fmeca() if request.query.lower() in str(rule).lower()]
+    all_rules = database.list_fmeca()
+    # 词面子串命中：只对"查询本身出现在规则文本里"这种直接情形有效
+    rules = [rule for rule in all_rules if request.query.lower() in str(rule).lower()]
     cases = database.search_cases(request.query, request.fault_code, request.top_k)
     # 混合检索（需求 6）：自适应切分块上的稠密+稀疏召回
     hybrid: list[dict[str, object]] = []
     try:
         agent = await get_chat_agent()
+        # 索引是懒加载的：本接口可能在聊天之前被首次调用（用户直接打开知识库页检索），
+        # 缺这一步会拿到空索引并静默返回 0 条结果。
+        await agent.ensure_index()
         hits = await agent.index_retriever().search(
             request.query, top_k=request.top_k,
             fault_code=request.fault_code if request.fault_code else None,
@@ -486,13 +491,21 @@ async def knowledge_search(request: KnowledgeSearchRequest, _: CurrentUser) -> d
              "text": hit.chunk.text[:600], "bm25_rank": hit.bm25_rank, "dense_rank": hit.dense_rank}
             for hit in hits
         ]
+        # FMECA 规则补全：召回结果里已带 fault_code 的 FMECA 分块反映语义相关性，
+        # 比"查询串是规则文本子串"更能覆盖口语化提问（如"电流异常升高"）。
+        recalled_codes = [hit.chunk.fault_code for hit in hits
+                          if hit.chunk.doc_type == "fmeca" and hit.chunk.fault_code]
+        recalled_rules = [rule for rule in all_rules if int(rule["fault_code"]) in recalled_codes]
+        if recalled_rules:
+            known = {int(rule["fault_code"]) for rule in recalled_rules}
+            rules = recalled_rules + [rule for rule in rules if int(rule["fault_code"]) not in known]
     except Exception as error:  # noqa: BLE001 - 混合检索失败时退回词法结果
         from src.observability import get_logger
         get_logger("api").warning(json.dumps({"action": "hybrid_search_failed", "error": str(error)}, ensure_ascii=False))
     return {
         "query": request.query, "fmeca": rules[: request.top_k], "cases": cases,
         "chunks": hybrid,
-        "sources": ["fmeca_rules", "case_library", "knowledge_chunks(manual/spec/cost/fmeca)"],
+        "sources": ["fmeca_rules", "case_library", "knowledge_chunks(manual/spec/case/cost/guide/fmeca)"],
     }
 
 
