@@ -6,11 +6,12 @@
 
 意图路由（确定性优先，LLM 兜底）::
 
-    machine_info    设备档案 / 当前读数 / 健康分
-    machine_sop     维护 SOP（RAG 检索 manual + fmeca）
-    machine_records 诊断记录 / 维修历史
+    machine_info     设备档案 / 当前读数 / 健康分
+    machine_sop      维护 SOP（RAG 检索 manual + fmeca）
+    machine_records  诊断记录 / 维修历史
     knowledge_search 通用知识查询（全库 RAG）
-    general         兜底：设备列表概览 + 知识检索
+    general          兜底：设备列表概览 + 知识检索
+    chitchat         闲聊 / 系统自身相关（"我是谁""你好"）：不检索，直接自述
 
 回答组织：配置了 DeepSeek Key 时用 deepseek-chat，否则本地 qwen2.5:7b；
 LLM 不可用时直接模板化拼装工具结果，聊天窗口永远有答案。
@@ -45,6 +46,25 @@ _INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "general": ("全厂", "整体", "设备总数", "多少台", "高风险", "故障", "告警", " overview"),
 }
 
+#: 闲聊 / 元问题：问的是"你/系统"本身，而不是知识库内容。
+#: 这类问题必须走独立意图——否则会掉进 knowledge_search，被检索到的
+#: 无关手册条文冒充答案。命中任一关键词即归类（优先级高于知识检索）。
+_CHITCHAT_KEYWORDS: tuple[str, ...] = (
+    "我是谁", "你是谁", "你叫什么", "你能做什么", "你会什么", "你能干嘛", "你能干什么",
+    "介绍一下你", "自我介绍", "你好", "您好", "hi", "hello", "嗨", "哈喽",
+    "谢谢", "感谢", "多谢", "在吗", "在不在", "讲个笑话", "聊聊天", "测试一下", "随便聊聊",
+)
+
+#: 闲聊意图的确定性回答：不编造、不检索，直接说清系统身份与能查什么。
+_CHITCHAT_REPLY = (
+    "我是智维先知的设备查询助手，负责回答 CNC 设备相关的问题。"
+    "你能查的东西有三类：\n"
+    "1. 设备档案与实时状态——例如「CNC_078 现在状态怎么样」「全厂有多少台设备」；\n"
+    "2. 维护 SOP 与故障处理——例如「主轴温度过高怎么处理」「轴承磨损的维护步骤」；\n"
+    "3. 诊断与维修历史——例如「CNC_078 最近修过什么」「上次诊断是什么结论」。\n"
+    "我没有个人信息，也答不了与设备无关的问题。"
+)
+
 
 class ChatState(TypedDict):
     """One chat turn flowing through the graph."""
@@ -70,9 +90,17 @@ def extract_machine_id(question: str) -> str | None:
 
 
 def classify_intent(question: str) -> str:
-    """Keyword-based intent classification (fast, deterministic, offline)."""
+    """Keyword-based intent classification (fast, deterministic, offline).
+
+    命中顺序即优先级：闲聊 → 设备操作类 → 其他。**没有命中任何关键词时返回
+    ``knowledge_search``**——这是有意的：知识库检索是默认动作。但调用方
+    （``_node_classify``）会用 LLM 再做一次兜底判定，因为纯规则打不准
+    "今天天气怎么样"这类既不闲聊也不查库的问题。
+    """
 
     lowered = question.lower()
+    if any(keyword in lowered for keyword in _CHITCHAT_KEYWORDS):
+        return "chitchat"
     for intent, keywords in _INTENT_KEYWORDS.items():
         if any(keyword in lowered for keyword in keywords):
             return intent
@@ -148,19 +176,26 @@ class ChatAgent:
         return graph.compile()
 
     async def _node_classify(self, state: ChatState) -> dict[str, Any]:
-        """Rule-first intent classification with optional LLM rescue."""
+        """Rule-first intent classification with optional LLM rescue.
+
+        规则命中闲聊/设备操作类时直接采信，不再花 LLM 调用。只有规则落到
+        ``knowledge_search`` 默认值（即真的没认出意图）时才让云端模型兜底——
+        短问题同样要兜底：旧实现用 ``len(question) > 6`` 把"我是谁"这类
+        3 字问题排除在外，导致它一路走到知识检索。
+        """
 
         intent = classify_intent(state["question"])
-        if intent == "knowledge_search" and self._llm.deepseek_enabled and len(state["question"]) > 6:
-            # 只有规则打不准且云端可用时才花一次 LLM 调用做意图兜底
+        if intent == "knowledge_search" and self._llm.deepseek_enabled:
             try:
                 result = await self._llm.chat("chat", [
-                    {"role": "system", "content": "把用户问题分类为 machine_info/machine_sop/machine_records/knowledge_search 之一，只输出类别名。"},
+                    {"role": "system", "content": "把用户问题分类为 machine_info/machine_sop/machine_records/knowledge_search/irrelevant 之一，只输出类别名。irrelevant 表示与 CNC 设备运维完全无关的闲聊或无关话题。"},
                     {"role": "user", "content": state["question"]},
                 ])
-                guess = result.content.strip().lower()
+                guess = result.content.strip().lower().strip('"').strip()
                 if guess in {"machine_info", "machine_sop", "machine_records", "knowledge_search"}:
                     intent = guess
+                elif guess == "irrelevant":
+                    intent = "chitchat"
             except Exception as error:  # noqa: BLE001 - 意图兜底失败就用规则结果
                 LOGGER.warning(f"intent fallback failed: {error}")
         return {"intent": intent}
@@ -194,25 +229,44 @@ class ChatAgent:
             ]
             risky = [item for item in summary if (item.get("severity") or "") in {"high", "critical"}]
             facts.append({"type": "fleet", "data": {"total": len(summary), "at_risk": risky[:8]}})
+        elif intent == "chitchat":
+            # 闲聊/元问题不碰知识库：检索只会捞出无关条文冒充答案
+            facts.append({"type": "chitchat", "data": _CHITCHAT_REPLY})
         else:  # knowledge_search 兜底：全库混合检索
             hits = await self._index.retriever.search(state["question"], top_k=5)
-            facts.append({"type": "rag", "data": format_context(hits)})
+            # 检索可能返回空（相关性门槛判定"语料里没有能回应它的内容"）——
+            # 空结果要显式记一条 fact，交给 compose 说"没找到"，而不是静默走模板
+            facts.append({"type": "rag", "data": format_context(hits), "empty": not hits})
             citations.extend(citations_from(hits))
 
         return {"intent": intent, "facts": facts, "citations": citations}
 
     async def _node_compose(self, state: ChatState) -> dict[str, Any]:
-        """Organize tool results into a human answer; template fallback included."""
+        """Organize tool results into a human answer; template fallback included.
+
+        **必须走 JSON 出参**：``UnifiedLLMClient`` 对 DeepSeek 固定带
+        ``response_format={"type":"json_object"}``，而该接口要求 prompt 里出现
+        "json" 字样，否则直接 400。旧实现发的是"请依据以上工具结果回答…"这种
+        纯自然语言指令——每次 DeepSeek 组稿都必然 400 并静默降级到模板兜底，
+        聊天窗口于是永远在吐检索原文。这里把指令写成 JSON 契约（要求模型把
+        答案放进 ``answer`` 字段），既满足接口约束，也让输出可解析、可回退。
+        """
 
         facts_block = "\n".join(
             f"[{fact['type']}]\n{self._stringify(fact['data'])}" for fact in state["facts"]
         )
+        # 闲聊与"检索为空"两种情况都不该让模型自由发挥：前者是固定自述，
+        # 后者必须如实说"没找到"。这两类直接走模板，省一次调用也更可控。
+        if state["intent"] == "chitchat" or self._rag_is_empty(state):
+            return {"answer": self._template_answer(state), "llm_used": False}
+
         prompt_messages = [
             {"role": "system", "content": get_agent_config("chat").system_prompt},
             {"role": "user", "content":
                 f"用户问题：{state['question']}\n\n工具结果：\n{facts_block}\n\n"
                 + (f"相关长期记忆：\n{state['memory_context']}\n" if state["memory_context"] else "")
-                + "请依据以上工具结果回答，数字必须原样引用，不得编造。"},
+                + "请依据以上工具结果回答，数字必须原样引用，不得编造。"
+                + '严格只输出 JSON，结构为：{"answer": "给用户的完整中文回答"}。'},
         ]
         config = get_agent_config("chat")
         if self._llm.deepseek_enabled:
@@ -220,11 +274,39 @@ class ChatAgent:
         try:
             with traced("chat", "compose", intent=state["intent"]):
                 result = await self._llm.chat(config, prompt_messages)
-            answer = result.content.strip() or self._template_answer(state)
+            answer = self._extract_answer(result.content) or self._template_answer(state)
             return {"answer": answer, "llm_used": True}
         except Exception as error:  # noqa: BLE001 - LLM 不可用时保证聊天可用
             LOGGER.warning(f"compose fallback: {type(error).__name__}: {error}")
             return {"answer": self._template_answer(state), "llm_used": False}
+
+    @staticmethod
+    def _extract_answer(content: str) -> str:
+        """Pull the human answer out of the model's JSON envelope.
+
+        模型可能返回 ``{"answer": "..."}``、裸字符串或夹带 markdown 围栏；
+        解析失败时回退到原文（只要不是空串，仍比模板兜底更贴近问题）。
+        """
+
+        stripped = content.strip()
+        if not stripped:
+            return ""
+        parsed = UnifiedLLMClient.parse_json(stripped)
+        if isinstance(parsed, dict):
+            for key in ("answer", "回答", "content", "text"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return ""
+        return stripped if not stripped.startswith("{") else ""
+
+    @staticmethod
+    def _rag_is_empty(state: ChatState) -> bool:
+        """Report whether knowledge retrieval came back with nothing."""
+
+        return any(
+            fact["type"] == "rag" and fact.get("empty") for fact in state["facts"]
+        )
 
     # --- 工具细节 -----------------------------------------------------
 
@@ -254,7 +336,12 @@ class ChatAgent:
 
     @staticmethod
     def _template_answer(state: ChatState) -> str:
-        """Deterministic fallback so the chat window always answers."""
+        """Deterministic fallback so the chat window always answers.
+
+        关键约束：**未命中时不许把检索原文当答案吐出去**。检索为空意味着
+        语料里没有能支撑回答的内容，此时如实说明并提供改问建议，比贴一段
+        无关手册更像一个能用的助手。
+        """
 
         parts: list[str] = []
         for fact in state["facts"]:
@@ -270,8 +357,17 @@ class ChatAgent:
             elif fact["type"] == "fleet":
                 fleet = fact["data"]
                 parts.append(f"全厂共 {fleet['total']} 台设备，当前高风险 {len(fleet['at_risk'])} 台。")
+            elif fact["type"] == "chitchat":
+                parts.append(str(fact["data"]))
             elif fact["type"] == "rag":
-                parts.append("知识库检索结果：\n" + str(fact["data"])[:800])
+                if fact.get("empty"):
+                    parts.append(
+                        "知识库里没有检索到与这个问题相关的内容。"
+                        "请补充设备编号（如 CNC_078）或换成设备运维类问题，例如"
+                        "「主轴温度过高怎么处理」「CNC_025 最近修过什么」。"
+                    )
+                else:
+                    parts.append("知识库检索结果：\n" + str(fact["data"])[:800])
             elif fact["type"] == "diagnostics":
                 parts.append("最近诊断记录已附（见引用）。\n" + ChatAgent._stringify(fact["data"], 600))
             elif fact["type"] == "maintenance":

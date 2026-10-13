@@ -43,6 +43,35 @@ BM25_B = 0.75
 #: RRF 平滑常数：k 越大，头部排名的优势被稀释
 RRF_K = 60
 
+#: 中文停用字表：这些字在语料里出现频率可能并不高（"是"10%、"在"6%），
+#: 所以**不能**用文档频率判定——它们的信息量本身为零，只要命中的全是这类字，
+#: 就说明检索没有找到任何实质证据。中文按字切词时这点尤其致命：
+#: "我是谁" → 我/是/谁，其中只有"是"命中了 5 个 chunk，于是 5 条无关手册条文
+#: 被当作"知识库检索结果"拼进了聊天回答。
+_STOPWORD_CHARS: Final[frozenset[str]] = frozenset(
+    "的 了 是 在 有 和 与 或 就 都 而 及 其 这 那 之 也 还 被 把 为 以 于 对 从 到 会 能 可 要 不 没 无 我 你 他 她 它 们 谁 什 么 怎 样 哪 吗 呢 吧 啊 呀 哦 嗯 好 请 谢 再 见 个 些 上 下 里 中 后 前 时 分 秒 高 低 大 小 多 少 一 二 三 四 五 六 七 八 九 十".split()
+)
+#: 英文/数字停用词（型号与数字编号不在此列，它们是强信号）
+_STOPWORD_WORDS: Final[frozenset[str]] = frozenset(
+    "the a an of to in on for and or is are was were be been with by at as it this that what how why when where which who".split()
+)
+
+
+def is_stopword(token: str) -> bool:
+    """Report whether one token carries no retrieval signal on its own."""
+
+    if token in _STOPWORD_CHARS:
+        return True
+    if token in _STOPWORD_WORDS:
+        return True
+    # 单个纯数字（如"3"）在工程文档里遍地都是，不构成证据
+    return token.isdigit() and len(token) <= 2
+
+
+#: 信息量门槛豁免长度：查询本身 ≥ 该字符数时不做门槛判定。
+#: 长问题即使只命中常见词，也往往是真在问知识库里的东西，误杀代价高于放过。
+MIN_QUERY_CHARS_FOR_GATE = 10
+
 
 @dataclass(frozen=True, slots=True)
 class RetrievedChunk:
@@ -333,8 +362,41 @@ class HybridRetriever:
             ))
         # 同分时优先保留 BM25 命中术语更多的条目（精确术语优先）
         results.sort(key=lambda item: (item.score, len(item.matched_terms)), reverse=True)
+        hits = results[:top_k]
         LOGGER.info(f"rag search: query={query!r} sparse={len(sparse_hits)} dense={len(dense_hits)} fused={len(results)}")
-        return results[:top_k]
+        return self._apply_relevance_gate(query, hits, len(indexed_chunks))
+
+    def _apply_relevance_gate(
+        self,
+        query: str,
+        hits: list[RetrievedChunk],
+        total_chunks: int,
+    ) -> list[RetrievedChunk]:
+        """Discard hits whose only BM25 evidence is a stopword.
+
+        BM25 的 IDF 在词太常见时被截断到 0，但**分数仍为正**，于是"是"这类
+        功能字能把完全无关的 chunk 送进 top_k。这里以"查询里是否存在任一
+        实义词元命中"作为相关性判据：没有证据就返回空列表，让上层（聊天窗口）
+        明确说出"没检索到"，而不是把无关原文当作答案拼出去。
+
+        门槛只在"查询较短（< MIN_QUERY_CHARS_FOR_GATE）且 BM25 通道有输出"时
+        生效——纯向量命中的结果不动，长问题也不动，避免误伤正常召回。
+        """
+
+        if not hits or len(query.strip()) >= MIN_QUERY_CHARS_FOR_GATE or total_chunks <= 0:
+            return hits
+        informative = {term for term in tokenize(query) if term.strip() and not is_stopword(term)}
+        if not informative:
+            # 查询整句由停用字构成（"我是谁""谢谢""在吗"）——语料里不存在能支撑
+            # 回答它的内容，直接判为未命中。
+            LOGGER.info(f"rag relevance gate: query={query!r} 全部为停用字，判定未命中")
+            return []
+        matched_informative = [
+            hit for hit in hits if informative.intersection(hit.matched_terms)
+        ]
+        if not matched_informative:
+            LOGGER.info(f"rag relevance gate: query={query!r} 无实义词元命中（候选 {len(hits)} 条已丢弃）")
+        return matched_informative
 
     def stats(self) -> dict[str, Any]:
         """Return index statistics for the knowledge page and health checks."""

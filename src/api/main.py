@@ -25,6 +25,7 @@ from src.database.connection import Database
 from src.database.init_db import bootstrap_database
 from src.graph.main_graph import build_graph
 from src.knowledge.fault_graph import FaultGraph
+from src.severity import NEUTRAL_HEALTH as _NEUTRAL_HEALTH, severity_from_reading as _severity_from_reading
 from src.observability import (
     get_logger,
     log_stats,
@@ -58,6 +59,50 @@ class MaintenanceOrderRequest(BaseModel):
     maintenance_type: str = Field(default="corrective", max_length=32)
     technician: str = Field(default="待分配", max_length=64)
     notes: str = Field(default="", max_length=2000)
+
+
+# --- 严重度评分：统一口径 -------------------------------------------------
+# 口径已抽到 `src.severity`（诊断智能体也要用，不能从 API 层反向 import）。
+#   * health_score 缺失 → 按中性基线 0.8 处理（字段缺失 ≠ 设备离线）；
+#   * "离线"只由读数新鲜度决定——最新读数落后全局最新时间超过阈值才算离线。
+_OFFLINE_LAG_MINUTES = int(os.getenv("OFFLINE_LAG_MINUTES", "120"))
+
+
+def _parse_ts(value: object) -> datetime | None:
+    """宽松解析 ISO 时间戳，失败返回 None。"""
+
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _offline_predicate(machines: list[dict[str, object]]):
+    """返回判定"离线"的闭包：读数落后全局最新时间超过阈值即视为离线。"""
+
+    stamps = [_parse_ts((machine.get("latest_reading") or {}).get("timestamp")) for machine in machines]
+    valid = [stamp for stamp in stamps if stamp is not None]
+    newest = max(valid) if valid else None
+
+    def is_offline(machine: dict[str, object]) -> bool:
+        latest = machine.get("latest_reading")
+        if not isinstance(latest, dict):
+            return True
+        stamp = _parse_ts(latest.get("timestamp"))
+        if stamp is None or newest is None:
+            return True
+        return (newest - stamp).total_seconds() > _OFFLINE_LAG_MINUTES * 60
+
+    return is_offline
+
+
+class ReportPushRequest(BaseModel):
+    """维护报告推送参数：支持企业微信 / 飞书 / 钉钉群机器人 Webhook。"""
+
+    channel: str = Field(default="", max_length=16, description="feishu | wecom | dingtalk，留空读 .env")
+    webhook_url: str | None = Field(default=None, max_length=500, description="留空则用 .env 的 REPORT_WEBHOOK_URL")
 
 
 @asynccontextmanager
@@ -211,26 +256,16 @@ async def overview() -> dict[str, object]:
 
     database = get_database()
     machines = database.list_machines()
+    is_offline = _offline_predicate(machines)
     scored: list[dict[str, object]] = []
     for machine in machines:
-        history = database.get_readings(str(machine["id"]), 500)
-        latest = history[-1] if history else None
-        if latest:
-            stored_health = float(latest.get("health_score") or 0.8)
-            fault_code = int(latest.get("fault_code", 0))
-            # Primary signal: active fault code from simulator
-            # Secondary signal: health_score degradation
-            if fault_code > 0:
-                severity = "critical" if stored_health < 0.55 else "warning"
-            elif stored_health < 0.45:
-                severity = "critical"
-            elif stored_health < 0.55:
-                severity = "warning"
-            else:
-                severity = "normal"
-            scored.append({**machine, "live_health_score": stored_health, "live_anomaly_score": round(1.0 - stored_health, 4), "live_severity": severity, "live_fault_code": fault_code})
-        else:
+        latest = machine.get("latest_reading")
+        if not isinstance(latest, dict) or is_offline(machine):
             scored.append({**machine, "live_health_score": None, "live_anomaly_score": None, "live_severity": "offline", "live_fault_code": 0})
+            continue
+        # 主信号：仿真器写入的活动故障码；次信号：health_score 退化
+        score, severity = _severity_from_reading(latest.get("health_score"), int(latest.get("fault_code") or 0))
+        scored.append({**machine, "live_health_score": score, "live_anomaly_score": round(1.0 - score, 4), "live_severity": severity, "live_fault_code": int(latest.get("fault_code") or 0)})
     severities = {"normal": 0, "warning": 0, "critical": 0, "offline": 0}
     for machine in scored:
         severity = str(machine["live_severity"])
@@ -244,24 +279,15 @@ async def list_machines(status: str | None = Query(default=None)) -> dict[str, o
     """List machines, optionally filtered by persisted status."""
 
     machines = get_database().list_machines(status)
+    is_offline = _offline_predicate(machines)
     enriched: list[dict[str, object]] = []
     for machine in machines:
-        latest = machine.get("latest_reading") or {}
-        health = latest.get("health_score") if isinstance(latest, dict) else None
-        if health is not None:
-            stored_health = float(health)
-            fault_code = int(latest.get("fault_code", 0)) if isinstance(latest, dict) else 0
-            if fault_code > 0:
-                severity = "critical" if stored_health < 0.55 else "warning"
-            elif stored_health < 0.45:
-                severity = "critical"
-            elif stored_health < 0.55:
-                severity = "warning"
-            else:
-                severity = "normal"
-            enriched.append({**machine, "live_health_score": stored_health, "live_severity": severity, "live_fault_code": fault_code})
-        else:
+        latest = machine.get("latest_reading")
+        if not isinstance(latest, dict) or is_offline(machine):
             enriched.append({**machine, "live_health_score": None, "live_severity": "offline", "live_fault_code": 0})
+            continue
+        score, severity = _severity_from_reading(latest.get("health_score"), int(latest.get("fault_code") or 0))
+        enriched.append({**machine, "live_health_score": score, "live_severity": severity, "live_fault_code": int(latest.get("fault_code") or 0)})
     return {"items": enriched, "count": len(enriched)}
 
 
@@ -276,17 +302,8 @@ async def machine_detail(machine_id: str) -> dict[str, object]:
     history = database.get_readings(machine_id, 500)
     latest = history[-1] if history else None
     if latest:
-        stored_health = float(latest.get("health_score") or 0.8)
-        fault_code = int(latest.get("fault_code", 0))
-        if fault_code > 0:
-            severity = "critical" if stored_health < 0.55 else "warning"
-        elif stored_health < 0.45:
-            severity = "critical"
-        elif stored_health < 0.55:
-            severity = "warning"
-        else:
-            severity = "normal"
-        health_info = {"health_score": stored_health, "anomaly_score": round(1.0 - stored_health, 4), "severity": severity, "fault_code": fault_code}
+        score, severity = _severity_from_reading(latest.get("health_score"), int(latest.get("fault_code") or 0))
+        health_info = {"health_score": score, "anomaly_score": round(1.0 - score, 4), "severity": severity, "fault_code": int(latest.get("fault_code") or 0)}
     else:
         health_info = None
     return {"machine": machine, "health": health_info, "history": history, "diagnostics": database.list_diagnostics(machine_id, 20), "orders": [order for order in database.list_maintenance_orders(200) if order["machine_id"] == machine_id]}
@@ -301,17 +318,8 @@ async def machine_realtime(machine_id: str) -> dict[str, object]:
     if not history:
         raise HTTPException(status_code=404, detail="No telemetry for machine")
     latest = history[-1]
-    stored_health = float(latest.get("health_score") or 0.8)
-    fault_code = int(latest.get("fault_code", 0))
-    if fault_code > 0:
-        severity = "critical" if stored_health < 0.55 else "warning"
-    elif stored_health < 0.45:
-        severity = "critical"
-    elif stored_health < 0.55:
-        severity = "warning"
-    else:
-        severity = "normal"
-    return {"machine_id": machine_id, "reading": latest, "health": {"health_score": stored_health, "anomaly_score": round(1.0 - stored_health, 4), "severity": severity, "fault_code": fault_code}}
+    score, severity = _severity_from_reading(latest.get("health_score"), int(latest.get("fault_code") or 0))
+    return {"machine_id": machine_id, "reading": latest, "health": {"health_score": score, "anomaly_score": round(1.0 - score, 4), "severity": severity, "fault_code": int(latest.get("fault_code") or 0)}}
 
 
 @app.get("/api/machines/{machine_id}/history", tags=["machines"])
@@ -910,6 +918,70 @@ async def report_detail(report_id: str) -> dict[str, object]:
     if item is None:
         raise HTTPException(status_code=404, detail="Report not found")
     return item
+
+
+def _webhook_payload(channel: str, report: dict[str, object]) -> dict[str, object]:
+    """把报告渲染成各 IM 平台群机器人认识的报文格式。
+
+    * 飞书（feishu）：text 消息，兼容"自定义机器人"最简配置；
+    * 企业微信（wecom）：markdown 消息；
+    * 钉钉（dingtalk）：markdown 消息（带标题）。
+    """
+
+    title = str(report.get("title") or "维护报告")
+    summary = str(report.get("summary") or "")
+    markdown = str(report.get("markdown") or "")
+    body = markdown[:1800] + ("\n…（正文过长已截断，完整报告见系统）" if len(markdown) > 1800 else "")
+    text = f"【{title}】审批通过，维护报告已生成\n\n{summary}\n\n{body}"
+    if channel == "feishu":
+        return {"msg_type": "text", "content": {"text": text}}
+    if channel == "wecom":
+        return {"msgtype": "markdown", "markdown": {"content": text}}
+    if channel == "dingtalk":
+        return {"msgtype": "markdown", "markdown": {"title": title, "text": text}}
+    return {"text": text}
+
+
+@app.post("/api/reports/{report_id}/push", tags=["reports"])
+async def push_report(report_id: str, request: ReportPushRequest) -> dict[str, object]:
+    """把维护报告推送到企业微信 / 飞书 / 钉钉群机器人。
+
+    Webhook 地址优先取请求体，其次读 .env 的 ``REPORT_WEBHOOK_URL``；
+    渠道取请求体，其次 ``REPORT_WEBHOOK_TYPE``，默认飞书。未配置时返回 400 并给出配置指引。
+    """
+
+    database = get_database()
+    report = database.get_report(report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    url = (request.webhook_url or os.getenv("REPORT_WEBHOOK_URL") or "").strip()
+    channel = (request.channel or os.getenv("REPORT_WEBHOOK_TYPE") or "feishu").strip().lower()
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置推送地址：可在页面填入 Webhook URL，或在 .env 设置 REPORT_WEBHOOK_URL / REPORT_WEBHOOK_TYPE",
+        )
+
+    payload = _webhook_payload(channel, report)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, json=payload)
+    except Exception as error:  # 网络异常要让前端看到明确原因，而不是 500 堆栈
+        raise HTTPException(status_code=502, detail=f"推送失败：{error}") from error
+
+    pushed = response.status_code < 300
+    get_logger("api").info(json.dumps(
+        {"action": "report_push", "report_id": report_id, "channel": channel,
+         "status_code": response.status_code, "pushed": pushed}, ensure_ascii=False))
+    return {
+        "report_id": report_id,
+        "channel": channel,
+        "pushed": pushed,
+        "status_code": response.status_code,
+        "detail": "" if pushed else response.text[:300],
+    }
 
 
 # ============================================================================

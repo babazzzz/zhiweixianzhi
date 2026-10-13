@@ -37,7 +37,7 @@ export function DiagnosticsList({ diagnostics }: { diagnostics: Diagnostic[] }):
 }
 
 export function OrdersList({ orders }: { orders: WorkOrder[] }): JSX.Element {
-  return <div className="compact-table">{orders.map((item) => <div className="table-row" key={item.id}><span className="order-id">{item.id}</span><div><strong>{item.machine_id}</strong><small>{item.maintenance_type} · {item.technician}</small></div><span className="tag">{item.status}</span><time>{new Date(item.start_time).toLocaleString("zh-CN")}</time></div>)}</div>;
+  return <div className="compact-table">{orders.map((item) => <div className="table-row order-row" key={item.id}><span className="order-id">{item.id}</span><div><strong>{item.machine_id}</strong><small>{item.maintenance_type} · {item.technician}</small></div><span className="tag">{item.status}</span><time>{new Date(item.start_time).toLocaleString("zh-CN")}</time></div>)}</div>;
 }
 
 export function RulesTable({ rules }: { rules: Rule[] }): JSX.Element {

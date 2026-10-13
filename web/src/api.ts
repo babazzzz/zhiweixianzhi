@@ -45,6 +45,8 @@ export const api = {
   // === 维护报告（需求 8） ===
   reports: async (machineId?: string): Promise<ReportSummary[]> => (await request<{ items: ReportSummary[] }>(`/api/reports${machineId ? `?machine_id=${machineId}` : ""}`)).items,
   report: (id: string): Promise<ReportDetail> => request(`/api/reports/${id}`),
+  pushReport: (id: string, channel: string, webhookUrl?: string): Promise<{ report_id: string; channel: string; pushed: boolean; status_code: number; detail: string }> =>
+    request(`/api/reports/${id}/push`, { method: "POST", body: JSON.stringify({ channel, webhook_url: webhookUrl || undefined }) }),
   // === 技能注册表（需求 3） ===
   skills: async (): Promise<SkillMetaDef[]> => (await request<{ items: SkillMetaDef[] }>("/api/skills")).items,
   runSkill: (id: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> => request(`/api/skills/${id}/run`, { method: "POST", body: JSON.stringify({ payload }) }),

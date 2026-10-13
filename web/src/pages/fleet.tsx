@@ -16,12 +16,19 @@ import type { Diagnostic, DiagnosticPayload, Machine, Overview, WorkOrder } from
 type Page = "overview" | "machines" | "diagnostics" | "agents" | "chat" | "logs" | "reports" | "topology" | "knowledge" | "operations";
 
 const RISK_RANK: Record<string, number> = { critical: 0, emergency: 0, warning: 1, maintenance: 2, offline: 3, normal: 4, running: 4 };
+const RISKY = ["critical", "emergency", "warning"];
 
 function riskOf(machine: Machine): string {
   return machine.live_severity ?? machine.latest_diagnostic?.severity ?? machine.status ?? "normal";
 }
 
+function isRisky(machine: Machine): boolean {
+  return RISKY.includes(riskOf(machine));
+}
+
 export function OverviewPage({ overview, machines, onNavigate }: { overview: Overview | null; machines: Machine[]; onNavigate: (page: Page) => void }): JSX.Element {
+  const [line, setLine] = useState<string>("all");
+  const [onlyRisk, setOnlyRisk] = useState(false);
   if (!overview) return <Loading label="正在读取真实设备数据" />;
   const fleet = overview.fleet;
   // 风险优先：最需要关注的设备排最前，一眼看到红色
@@ -31,7 +38,17 @@ export function OverviewPage({ overview, machines, onNavigate }: { overview: Ove
     if (rankA !== rankB) return rankA - rankB;
     return (a.live_health_score ?? 1) - (b.live_health_score ?? 1);
   });
-  const risky = sorted.filter((machine) => ["critical", "emergency", "warning"].includes(riskOf(machine)));
+  const risky = sorted.filter(isRisky);
+  // 产线维度：来自设备主数据的 production_line 字段（100 台全覆盖）
+  const lines = Array.from(new Set(machines.map((machine) => machine.production_line))).sort();
+  const lineStats = lines.map((name) => {
+    const members = machines.filter((machine) => machine.production_line === name);
+    const scored = members.filter((machine) => machine.live_health_score != null);
+    const average = scored.length ? scored.reduce((sum, machine) => sum + (machine.live_health_score ?? 0), 0) / scored.length : 0;
+    return { name, total: members.length, risky: members.filter(isRisky).length, average };
+  });
+  const scoped = sorted.filter((machine) => (line === "all" || machine.production_line === line) && (!onlyRisk || isRisky(machine)));
+
   return <>
     <div className="metric-grid">
       <Metric label="在线设备" value={`${fleet.total - fleet.offline} / ${fleet.total}`} note="已纳入监测链路" />
@@ -39,41 +56,59 @@ export function OverviewPage({ overview, machines, onNavigate }: { overview: Ove
       <Metric label="高风险设备" value={String(fleet.critical)} note="需优先评审" tone="critical" />
       <Metric label="未处置告警" value={String(fleet.warning + fleet.critical)} note="来自实时异常检测" tone="warning" />
     </div>
-    <div className="two-column">
-      <section className="panel">
-        <PanelTitle title="设备健康矩阵（风险优先）" action="查看设备" onAction={() => onNavigate("machines")} />
-        <div className="machine-grid">
-          {sorted.slice(0, 24).map((machine) => {
-            const risk = riskOf(machine);
-            return <button className={`machine-cell ${["critical", "emergency", "warning"].includes(risk) ? "risky" : ""}`} key={machine.id} title={`${machine.id} · ${risk}`} onClick={() => onNavigate("machines")}>
-              <header><b>{machine.id.replace("CNC_", "#")}</b><RiskBadge severity={risk} /></header>
-              <HealthBar score={machine.live_health_score ?? machine.latest_reading?.health_score ?? null} />
-            </button>;
-          })}
+
+    <section className="panel matrix-panel">
+      <div className="panel-title">
+        <h3>设备健康矩阵 · 风险优先（{scoped.length} / {machines.length} 台）</h3>
+        <button className="text-button" onClick={() => onNavigate("machines")}>查看设备 →</button>
+      </div>
+      <div className="matrix-toolbar">
+        <div className="filter-pills">
+          <button className={line === "all" ? "selected" : ""} onClick={() => setLine("all")}>全部产线 {machines.length}</button>
+          {lineStats.map((item) => <button key={item.name} className={line === item.name ? "selected" : ""} onClick={() => setLine(item.name)}>
+            {item.name} {item.total}{item.risky > 0 ? ` · ${item.risky} 风险` : ""}
+          </button>)}
         </div>
-        {machines.length > 24 && <p className="muted">其余 {machines.length - 24} 台设备在「设备」页查看。</p>}
-      </section>
+        <label className="matrix-toggle"><input type="checkbox" checked={onlyRisk} onChange={(event) => setOnlyRisk(event.target.checked)} />只看风险设备</label>
+      </div>
+      {line !== "all" && <p className="muted matrix-hint">
+        {lineStats.find((item) => item.name === line)?.total} 台设备 · 高风险 {lineStats.find((item) => item.name === line)?.risky} 台 ·
+        平均健康度 {((lineStats.find((item) => item.name === line)?.average ?? 0) * 100).toFixed(1)}%
+      </p>}
+      <div className="machine-grid">
+        {scoped.map((machine) => {
+          const risk = riskOf(machine);
+          return <button className={`machine-cell ${isRisky(machine) ? "risky" : ""}`} key={machine.id}
+            title={`${machine.id} · ${machine.production_line} · ${risk}`} onClick={() => onNavigate("machines")}>
+            <header><b>{machine.id.replace("CNC_", "#")}</b><RiskBadge severity={risk} /></header>
+            <HealthBar score={machine.live_health_score ?? machine.latest_reading?.health_score ?? null} />
+            <small className="machine-line">{machine.production_line}</small>
+          </button>;
+        })}
+        {scoped.length === 0 && <Empty label="该筛选条件下没有设备。" />}
+      </div>
+    </section>
+
+    <div className="two-column">
       <section className="panel">
         <PanelTitle title={`实时风险队列 (${risky.length})`} action="进入诊断中心" onAction={() => onNavigate("diagnostics")} />
         {risky.length
           ? <div className="queue">{risky.slice(0, 10).map((machine) => <div className="queue-row" key={machine.id}>
               <span className={`status-dot ${riskOf(machine)}`} />
-              <div><strong>{machine.id}</strong><p><RiskBadge severity={riskOf(machine)} />{machine.live_health_score != null && ` 健康度 ${(machine.live_health_score * 100).toFixed(1)}%`}{machine.latest_diagnostic && ` · 置信度 ${(machine.latest_diagnostic.confidence * 100).toFixed(0)}%`}</p></div>
+              <div><strong>{machine.id}<small className="queue-line"> · {machine.production_line}</small></strong><p><RiskBadge severity={riskOf(machine)} />{machine.live_health_score != null && ` 健康度 ${(machine.live_health_score * 100).toFixed(1)}%`}{machine.latest_diagnostic && ` · 置信度 ${(machine.latest_diagnostic.confidence * 100).toFixed(0)}%`}</p></div>
               <button className="text-button" onClick={() => onNavigate("diagnostics")}>诊断</button>
             </div>)}</div>
           : <Empty label="暂无异常设备；系统仍持续监控。" />}
       </section>
-    </div>
-    <div className="two-column">
       <section className="panel">
         <PanelTitle title="最近诊断" action="全部记录" onAction={() => onNavigate("diagnostics")} />
         {overview.diagnostics.length ? <DiagnosticsList diagnostics={overview.diagnostics.slice(0, 6)} /> : <Empty label="尚未触发诊断。" />}
       </section>
-      <section className="panel">
-        <PanelTitle title="运维工单" action="工单中心" onAction={() => onNavigate("operations")} />
-        {overview.orders.length ? <OrdersList orders={overview.orders.slice(0, 6)} /> : <Empty label="尚无人工确认的维护工单。" />}
-      </section>
     </div>
+    <section className="panel">
+      <PanelTitle title="运维工单" action="工单中心" onAction={() => onNavigate("operations")} />
+      {overview.orders.length ? <OrdersList orders={overview.orders.slice(0, 6)} /> : <Empty label="尚无人工确认的维护工单。" />}
+    </section>
   </>;
 }
 

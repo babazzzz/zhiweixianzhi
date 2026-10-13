@@ -3,57 +3,202 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { CasesList, Empty, PanelTitle, RulesTable } from "../components/ui";
-import type { CaseItem, Rule, Topology, TopologyEdge, TopologyNode } from "../types";
+import type { CaseItem, Diagnostic, Machine, Rule, Topology, TopologyNode } from "../types";
+
+/** 传感器指标 → 故障图"征兆"节点的映射。
+ *
+ * 这是把"设备当前哪几个维度异常"翻译成因果图入口的字典——没有它，图谱只是
+ * 一张静态的关系图；有了它，选一台设备就能沿因果链推演它会怎么坏、坏到哪。
+ */
+const SYMPTOM_METRICS: Record<string, string[]> = {
+  voltage_instability: ["op_voltage", "power_factor", "harmonic_distortion"],
+  current_spike: ["op_amperage", "spindle_load"],
+  temperature_rise: ["op_temperature", "coolant_temp", "bearing_temp"],
+  vibration_increase: ["vibration_rms", "motor_vibration"],
+  speed_drop: ["rotor_speed"],
+};
+
+const LAYER_X: Record<string, number> = { symptom: 178, fault: 590, consequence: 1000 };
+const NODE_RADIUS: Record<string, number> = { symptom: 30, fault: 34, consequence: 30 };
 
 export function TopologyPage(): JSX.Element {
   const [topology, setTopology] = useState<Topology | null>(null);
-  const [mode, setMode] = useState<"production" | "causal">("production");
-  useEffect(() => { void api.topology().then(setTopology).catch(() => setTopology(null)); }, []);
-  if (!topology) return <Loading label="加载设备关联图谱" />;
-  const nodes = topology.nodes.filter((node) => mode === "production" ? node.type === "machine" || node.type === "line" : node.type.startsWith("fault_"));
-  const allowed = new Set(nodes.map((node) => node.id));
-  const edges = topology.edges.filter((edge) => allowed.has(edge.source) && allowed.has(edge.target));
-  return <section className="panel graph-panel">
-    <div className="graph-header">
-      <div><p className="eyebrow">Knowledge graph</p><h2>设备与故障关联图谱</h2>
-        <p className="muted">设备—产线关系来自设备主数据；故障关系来自 FMECA 因果传播图。</p></div>
-      <div className="segmented">
-        <button className={mode === "production" ? "selected" : ""} onClick={() => setMode("production")}>生产设备关联</button>
-        <button className={mode === "causal" ? "selected" : ""} onClick={() => setMode("causal")}>故障因果图</button>
+  const [machines, setMachines] = useState<Machine[]>([]);
+  const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
+  const [selected, setSelected] = useState<string>("");
+
+  useEffect(() => {
+    void api.topology().then(setTopology).catch(() => setTopology(null));
+    void api.machines().then(setMachines).catch(() => setMachines([]));
+    void api.diagnostics().then(setDiagnostics).catch(() => setDiagnostics([]));
+  }, []);
+
+  // 每台设备只保留最近一次诊断——图谱要给的是"当前状态",不是历史堆积
+  const latestByMachine = useMemo(() => {
+    const map = new Map<string, Diagnostic>();
+    for (const item of [...diagnostics].sort((a, b) => a.created_at.localeCompare(b.created_at))) map.set(item.machine_id, item);
+    return map;
+  }, [diagnostics]);
+
+  const riskyMachines = useMemo(
+    () => machines.filter((machine) => ["critical", "emergency", "warning"].includes(String(machine.live_severity ?? ""))),
+    [machines],
+  );
+
+  /** 因果追溯：从设备的故障模式出发，向上取征兆、向下取后果，得到高亮子图。 */
+  const trace = useMemo(() => {
+    if (!topology || !selected) return null;
+    const diagnostic = latestByMachine.get(selected);
+    const faultName = diagnostic?.payload?.fault_mode ?? "";
+    const faultNode = topology.nodes.find((node) => node.type === "fault" && node.label === faultName) ?? null;
+    const anomalous = new Set(diagnostic?.payload?.anomaly_dims ?? []);
+    const symptomIds = new Set(
+      topology.nodes
+        .filter((node) => node.type === "symptom" && (SYMPTOM_METRICS[node.id.replace("fault:", "")] ?? []).some((metric) => anomalous.has(metric)))
+        .map((node) => node.id),
+    );
+    const nodeIds = new Set<string>();
+    const edgeKeys = new Set<string>();
+    if (faultNode) {
+      nodeIds.add(faultNode.id);
+      const walk = (direction: "up" | "down"): void => {
+        const stack = [faultNode.id];
+        const seen = new Set<string>([faultNode.id]);
+        while (stack.length) {
+          const current = stack.pop() as string;
+          for (const edge of topology.edges) {
+            const next = direction === "up" ? (edge.target === current ? edge.source : null) : (edge.source === current ? edge.target : null);
+            if (!next || seen.has(next)) continue;
+            seen.add(next);
+            nodeIds.add(next);
+            edgeKeys.add(`${edge.source}->${edge.target}`);
+            stack.push(next);
+          }
+        }
+      };
+      walk("up");
+      walk("down");
+    }
+    return { diagnostic, faultName, faultNode, symptomIds, nodeIds, edgeKeys };
+  }, [topology, selected, latestByMachine]);
+
+  if (!topology) return <Loading label="加载故障因果图谱" />;
+
+  return <>
+    <section className="panel graph-panel">
+      <div className="graph-header">
+        <div>
+          <p className="eyebrow">Fault causality graph</p>
+          <h2>故障因果追溯</h2>
+          <p className="muted">中间层是 FMECA 故障模式，左侧是它在传感器上的征兆，右侧是若不处置会演化的后果。选一台设备，就能看到它的异常指标落在哪条因果链上。</p>
+        </div>
+        <div className="graph-controls">
+          <select value={selected} onChange={(event) => setSelected(event.target.value)}>
+            <option value="">不选中设备（查看全图）</option>
+            <optgroup label={`高风险设备 ${riskyMachines.length} 台`}>
+              {riskyMachines.map((machine) => <option key={machine.id} value={machine.id}>{machine.id} · {machine.production_line}</option>)}
+            </optgroup>
+            <optgroup label="全部设备">
+              {machines.filter((machine) => !riskyMachines.includes(machine)).map((machine) => <option key={machine.id} value={machine.id}>{machine.id}</option>)}
+            </optgroup>
+          </select>
+        </div>
       </div>
-    </div>
-    <TopologyCanvas nodes={nodes} edges={edges} mode={mode} />
-    <div className="legend"><span><i className="legend-dot line" />产线</span><span><i className="legend-dot machine" />设备</span><span><i className="legend-dot fault" />故障/症状/后果</span><span>共 {nodes.length} 节点，{edges.length} 条真实关联</span></div>
-  </section>;
+      <CausalCanvas topology={topology} trace={trace} />
+      <div className="legend">
+        <span><i className="legend-dot symptom" />征兆（传感器指标）</span>
+        <span><i className="legend-dot fault" />故障模式（FMECA）</span>
+        <span><i className="legend-dot consequence" />后果</span>
+        <span>共 {topology.nodes.filter((node) => node.type.startsWith("fault_")).length} 个节点、{topology.edges.filter((edge) => edge.type === "causal").length} 条因果关系；连线上的数字是因果概率</span>
+      </div>
+    </section>
+
+    {trace && <section className="panel trace-panel">
+      <PanelTitle title={`因果追溯 · ${selected}`} />
+      {trace.faultName
+        ? <>
+          <div className="trace-chain">
+            <span className="trace-step">{trace.symptomIds.size} 项异常征兆</span>
+            <i>→</i>
+            <span className="trace-step strong">{trace.faultName}</span>
+            <i>→</i>
+            <span className="trace-step">{Math.max((trace.nodeIds.size ?? 0) - 1, 0)} 个下游后果</span>
+          </div>
+          <p className="muted">
+            设备最近一次诊断（{trace.diagnostic ? new Date(trace.diagnostic.created_at).toLocaleString("zh-CN") : "—"}）
+            判定为「{trace.faultName}」{trace.faultNode ? "" : "（该故障模式暂无对应因果节点）"}。
+            {(trace.diagnostic?.payload?.anomaly_dims?.length ?? 0) > 0 && `当前异常维度：${(trace.diagnostic?.payload?.anomaly_dims ?? []).join("、")}。`}
+          </p>
+          {trace.diagnostic?.payload?.root_cause && <p className="muted">根因：{trace.diagnostic.payload.root_cause}</p>}
+        </>
+        : <Empty label="该设备暂无诊断记录，无法定位故障模式。建议先到诊断中心触发一次诊断。" />}
+    </section>}
+  </>;
 }
 
 function Loading({ label }: { label: string }): JSX.Element {
   return <div className="loading"><span className="spinner" />{label}</div>;
 }
 
-function TopologyCanvas({ nodes, edges, mode }: { nodes: TopologyNode[]; edges: TopologyEdge[]; mode: "production" | "causal" }): JSX.Element {
+interface CausalTrace {
+  diagnostic: Diagnostic | undefined;
+  faultName: string;
+  faultNode: TopologyNode | null;
+  symptomIds: Set<string>;
+  nodeIds: Set<string>;
+  edgeKeys: Set<string>;
+}
+
+function CausalCanvas({ topology, trace }: { topology: Topology; trace: CausalTrace | null }): JSX.Element {
+  const nodes = useMemo(() => topology.nodes.filter((node) => node.type.startsWith("fault_")), [topology]);
+  const nodeIds = useMemo(() => new Set(nodes.map((node) => node.id)), [nodes]);
+  const edges = useMemo(() => topology.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)), [topology, nodeIds]);
   const positions = useMemo(() => {
     const map = new Map<string, { x: number; y: number }>();
-    if (mode === "production") {
-      const lines = nodes.filter((item) => item.type === "line");
-      const machines = nodes.filter((item) => item.type === "machine");
-      lines.forEach((line, index) => map.set(line.id, { x: 120, y: 115 + index * 148 }));
-      machines.forEach((machine) => {
-        const lineIndex = lines.findIndex((line) => line.id === machine.line);
-        const positionInLine = machines.filter((item) => item.line === machine.line).findIndex((item) => item.id === machine.id);
-        map.set(machine.id, { x: 300 + (positionInLine % 10) * 86, y: 62 + Math.max(0, lineIndex) * 148 + Math.floor(positionInLine / 10) * 58 });
-      });
-    } else {
-      nodes.forEach((node, index) => {
-        const angle = (Math.PI * 2 * index) / Math.max(nodes.length, 1) - Math.PI / 2;
-        map.set(node.id, { x: 530 + Math.cos(angle) * 300, y: 280 + Math.sin(angle) * 190 });
+    for (const type of ["symptom", "fault", "consequence"]) {
+      const group = nodes.filter((node) => node.type === `fault_${type}`);
+      group.forEach((node, index) => {
+        const y = 92 + index * (568 / Math.max(group.length - 1, 1));
+        map.set(node.id, { x: LAYER_X[type], y });
       });
     }
     return map;
-  }, [mode, nodes]);
-  return <div className="topology-canvas"><svg viewBox="0 0 1200 740" role="img" aria-label="设备与故障关联图谱">
-    <g>{edges.map((edge, index) => { const source = positions.get(edge.source); const target = positions.get(edge.target); return source && target ? <line key={`${edge.source}-${edge.target}-${index}`} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${edge.type}`} /> : null; })}</g>
-    <g>{nodes.map((node) => { const point = positions.get(node.id); if (!point) return null; const nodeClass = node.type === "line" ? "line" : node.type === "machine" ? `machine ${node.status ?? "running"}` : "fault"; return <g key={node.id} transform={`translate(${point.x}, ${point.y})`} className="graph-node"><circle r={node.type === "line" ? 24 : node.type === "machine" ? 13 : 22} className={nodeClass} /><text y={node.type === "machine" ? 29 : 43} textAnchor="middle">{node.label}</text></g>; })}</g>
+  }, [nodes]);
+
+  const isDimmed = (nodeId: string): boolean => Boolean(trace?.faultNode) && !trace?.nodeIds.has(nodeId);
+  const isDimmedEdge = (source: string, target: string): boolean => Boolean(trace?.faultNode) && !trace?.edgeKeys.has(`${source}->${target}`);
+
+  return <div className="topology-canvas"><svg viewBox="0 0 1200 740" role="img" aria-label="故障因果追溯图谱">
+    <g>
+      <text className="layer-label" x={LAYER_X.symptom} y={46} textAnchor="middle">传感器征兆</text>
+      <text className="layer-label" x={LAYER_X.fault} y={46} textAnchor="middle">故障模式（FMECA）</text>
+      <text className="layer-label" x={LAYER_X.consequence} y={46} textAnchor="middle">演化后果</text>
+    </g>
+    <g>{edges.map((edge, index) => {
+      const source = positions.get(edge.source);
+      const target = positions.get(edge.target);
+      if (!source || !target) return null;
+      const dim = isDimmedEdge(edge.source, edge.target);
+      const midpointX = (source.x + target.x) / 2;
+      const midpointY = (source.y + target.y) / 2;
+      return <g key={`${edge.source}-${edge.target}-${index}`} className={dim ? "dim" : ""}>
+        <line x1={source.x} y1={source.y} x2={target.x} y2={target.y} className="graph-edge causal" />
+        <rect className="edge-label-bg" x={midpointX - 17} y={midpointY - 9} width={34} height={16} rx={8} />
+        <text className="edge-label" x={midpointX} y={midpointY + 3} textAnchor="middle">{Math.round((edge.probability ?? 0) * 100)}%</text>
+      </g>;
+    })}</g>
+    <g>{nodes.map((node) => {
+      const point = positions.get(node.id);
+      if (!point) return null;
+      const layer = node.type.replace("fault_", "");
+      const isSymptomHit = trace?.symptomIds.has(node.id);
+      const isFaultHit = trace?.faultNode?.id === node.id;
+      const classes = [layer, isDimmed(node.id) ? "dim" : "", isFaultHit ? "active-fault" : "", isSymptomHit ? "active-symptom" : ""].filter(Boolean).join(" ");
+      return <g key={node.id} transform={`translate(${point.x}, ${point.y})`} className="graph-node">
+        <circle r={NODE_RADIUS[layer]} className={classes} />
+        <text y={NODE_RADIUS[layer] + 16} textAnchor="middle">{node.label}</text>
+      </g>;
+    })}</g>
   </svg></div>;
 }
 
@@ -115,7 +260,7 @@ export function OperationsPage({ machines }: { machines: Array<{ id: string }> }
     {message && <div className="notice-banner">{message}</div>}
     <section className="panel">
       <PanelTitle title="工单队列" />
-      {orders.length ? <div className="compact-table">{orders.map((item) => <div className="table-row" key={item.id}><span className="order-id">{item.id}</span><div><strong>{item.machine_id}</strong><small>{item.maintenance_type} · {item.technician}</small></div><span className="tag">{item.status}</span><time>{new Date(item.start_time).toLocaleString("zh-CN")}</time></div>)}</div> : <Empty label="尚无工单。" />}
+      {orders.length ? <div className="compact-table">{orders.map((item) => <div className="table-row order-row" key={item.id}><span className="order-id">{item.id}</span><div><strong>{item.machine_id}</strong><small>{item.maintenance_type} · {item.technician}</small></div><span className="tag">{item.status}</span><time>{new Date(item.start_time).toLocaleString("zh-CN")}</time></div>)}</div> : <Empty label="尚无工单。" />}
     </section>
   </>;
 }

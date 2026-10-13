@@ -9,7 +9,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { Empty, Loading, PanelTitle } from "../components/ui";
-import type { ChatThread, ChatTurn } from "../types";
+import { MarkdownView } from "../components/markdown";
+import { downloadMarkdown, downloadWord, printReport } from "../reportExport";
+import type { ChatThread, ChatTurn, ReportDetail } from "../types";
 
 interface Bubble { role: "user" | "assistant"; content: string; meta?: string; llm?: boolean; }
 
@@ -28,6 +30,27 @@ export function ChatPage(): JSX.Element {
   }, []);
   useEffect(() => { void refreshThreads(); }, [refreshThreads]);
   useEffect(() => { listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" }); }, [bubbles]);
+
+  /** 开一个新话题：清空当前会话与气泡，下一条提问会让后端新建 thread。 */
+  const startNewThread = (): void => {
+    setThreadId(null);
+    setBubbles([]);
+    setInput("");
+  };
+
+  /** 切到历史会话时把消息读回来，避免只显示一句提示、看不到上下文。 */
+  const openThread = async (thread: ChatThread): Promise<void> => {
+    setThreadId(thread.id);
+    setBubbles([{ role: "assistant", content: "正在载入会话记录…" }]);
+    try {
+      const detail = await api.chatThreadMessages(thread.id);
+      setBubbles(detail.messages.length
+        ? detail.messages.map((message) => ({ role: message.role, content: message.content, meta: message.intent ?? undefined }))
+        : [{ role: "assistant", content: `会话「${thread.title}」暂无消息记录。` }]);
+    } catch {
+      setBubbles([{ role: "assistant", content: `已切换到会话「${thread.title}」，继续提问即可。` }]);
+    }
+  };
 
   const send = async (question: string): Promise<void> => {
     const text = question.trim();
@@ -48,10 +71,13 @@ export function ChatPage(): JSX.Element {
 
   return <div className="chat-layout">
     <aside className="panel chat-threads">
-      <PanelTitle title="会话历史" />
+      <div className="panel-title">
+        <h3>会话历史</h3>
+        <button className="button ghost new-thread" onClick={startNewThread}>＋ 新建对话</button>
+      </div>
       {threads.length === 0 && <Empty label="暂无会话，发第一条提问即可。" />}
       <div className="thread-list">
-        {threads.map((thread) => <button key={thread.id} className={`thread-row ${thread.id === threadId ? "selected" : ""}`} onClick={() => { setThreadId(thread.id); setBubbles([{ role: "assistant", content: `已切换到会话「${thread.title}」，继续提问即可。` }]); }}>
+        {threads.map((thread) => <button key={thread.id} className={`thread-row ${thread.id === threadId ? "selected" : ""}`} onClick={() => void openThread(thread)}>
           <strong>{thread.title}</strong>
           <small>{thread.message_count} 条 · {new Date(thread.updated_at).toLocaleString("zh-CN")}</small>
         </button>)}
@@ -143,23 +169,45 @@ export function LogsPage(): JSX.Element {
 
 export function ReportsPage(): JSX.Element {
   const [reports, setReports] = useState<ReportSummaryLite[]>([]);
-  const [detail, setDetail] = useState<{ title: string; markdown: string; generated_at: string } | null>(null);
+  const [detail, setDetail] = useState<ReportDetail | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [channel, setChannel] = useState("feishu");
+  const [webhook, setWebhook] = useState("");
+  const [pushing, setPushing] = useState(false);
+
+  const openReport = useCallback(async (id: string): Promise<void> => {
+    try { setDetail(await api.report(id)); setNotice(""); }
+    catch (reason: unknown) { setError(reason instanceof Error ? reason.message : "报告详情加载失败"); }
+  }, []);
 
   const load = useCallback(async () => {
-    try { setReports(await api.reports()); setError(""); } catch (reason: unknown) { setError(reason instanceof Error ? reason.message : "报告加载失败"); }
+    try { setReports(await api.reports()); setError(""); }
+    catch (reason: unknown) { setError(reason instanceof Error ? reason.message : "报告加载失败"); }
   }, []);
   useEffect(() => { void load(); }, [load]);
+  // 默认打开最新一份，避免右侧一开始是空白
+  useEffect(() => { if (!detail && reports.length) void openReport(reports[0].id); }, [reports, detail, openReport]);
 
-  const open = async (id: string): Promise<void> => {
-    try { setDetail(await api.report(id)); } catch (reason: unknown) { setError(reason instanceof Error ? reason.message : "报告详情加载失败"); }
+  const push = async (): Promise<void> => {
+    if (!detail) return;
+    setPushing(true);
+    setNotice("正在推送到群机器人…");
+    try {
+      const response = await api.pushReport(detail.id, channel, webhook.trim() || undefined);
+      setNotice(response.pushed
+        ? `✅ 已推送到 ${response.channel}（HTTP ${response.status_code}）`
+        : `⚠️ 推送未成功（HTTP ${response.status_code}）：${response.detail || "请检查 Webhook 地址"}`);
+    } catch (reason: unknown) {
+      setNotice(`推送失败：${reason instanceof Error ? reason.message : "未知错误"}`);
+    } finally { setPushing(false); setTimeout(() => setNotice(""), 8000); }
   };
 
   return <div className="split-layout">
     <section className="asset-list panel">
       <PanelTitle title={`维护报告 (${reports.length})`} action="刷新" onAction={() => void load()} />
       {reports.length === 0 && <Empty label="暂无报告。在 Agent 监控页批准一条高风险通知后，系统会自动生成。" />}
-      {reports.map((item) => <button key={item.id} className={`asset-row ${detail?.title === item.title ? "selected" : ""}`} onClick={() => void open(item.id)}>
+      {reports.map((item) => <button key={item.id} className={`asset-row ${detail?.id === item.id ? "selected" : ""}`} onClick={() => void openReport(item.id)}>
         <span className="status-dot critical" />
         <div><strong>{item.machine_id} 维护报告</strong><small>{item.summary.slice(0, 42)}…</small></div>
         <em>{new Date(item.generated_at).toLocaleDateString("zh-CN")}</em>
@@ -168,17 +216,31 @@ export function ReportsPage(): JSX.Element {
     <section className="asset-detail">
       <section className="panel report-detail">
         {error && <div className="error-banner">{error}</div>}
-        {detail ? <article className="markdown">
-          <h2>{detail.title}</h2>
-          <p className="muted">生成于 {new Date(detail.generated_at).toLocaleString("zh-CN")}</p>
-          {detail.markdown.split("\n").map((line, index) => {
-            if (line.startsWith("## ")) return <h3 key={index}>{line.slice(3)}</h3>;
-            if (line.startsWith("# ")) return null;
-            if (line.startsWith("- ") || /^\d+\./.test(line)) return <p className="md-li" key={index}>{line.replace(/^[-\s]|\d+\.\s*/, "")}</p>;
-            if (line.startsWith("|")) return <p className="md-table" key={index}>{line.replace(/\|/g, "  ")}</p>;
-            return line.trim() ? <p key={index}>{line}</p> : null;
-          })}
-        </article> : <Loading label="选择左侧报告查看正文" />}
+        {notice && <div className="notice-banner">{notice}</div>}
+        {detail ? <>
+          <div className="report-toolbar">
+            <div className="report-actions">
+              <button className="button ghost" onClick={() => downloadMarkdown(detail)}>导出 Markdown</button>
+              <button className="button ghost" onClick={() => downloadWord(detail)}>导出 Word</button>
+              <button className="button ghost" onClick={() => printReport(detail)}>打印 / 存 PDF</button>
+            </div>
+            <div className="report-push">
+              <select value={channel} onChange={(event) => setChannel(event.target.value)}>
+                <option value="feishu">飞书</option>
+                <option value="wecom">企业微信</option>
+                <option value="dingtalk">钉钉</option>
+              </select>
+              <input value={webhook} placeholder="群机器人 Webhook（留空用 .env 配置）"
+                onChange={(event) => setWebhook(event.target.value)} />
+              <button className="button primary" disabled={pushing} onClick={() => void push()}>{pushing ? "推送中…" : "推送到群"}</button>
+            </div>
+          </div>
+          <article className="report-body">
+            <h2>{detail.title}</h2>
+            <p className="muted">报告编号 {detail.id} · 生成于 {new Date(detail.generated_at).toLocaleString("zh-CN")}</p>
+            <MarkdownView markdown={detail.markdown} />
+          </article>
+        </> : <Loading label="选择左侧报告查看正文" />}
       </section>
     </section>
   </div>;

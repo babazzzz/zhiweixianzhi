@@ -54,13 +54,47 @@ def test_generates_report_and_persists(memory_db):
     assert saved is not None and saved["markdown"] == out["markdown"]
 
     md = out["markdown"]
-    # 关键章节齐全（对前端锚点 / 竞赛演示很关键）
-    for section in ("一、设备概况", "二、诊断结论", "三、根因机理与处置规程", "六、维护建议"):
+    # 关键章节齐全（对前端锚点 / 竞赛演示很关键）——章节号随报告增强后调整
+    for section in ("一、设备概况", "二、诊断结论", "五、根因机理与处置规程", "十、维护建议与追溯"):
         assert section in md
     # 头部应能追溯审批/诊断来源
     assert "NOTIF-9" in md and "DIA-TEST-1" in md and "管理员" in md
     # data_sources 标注了数据出处
     assert any("fmeca_rules" in s for s in out["data_sources"])
+
+
+def test_data_analysis_section_uses_fleet_baseline(memory_db):
+    """给定 22 维读数与历史窗口，报告应产出「数据分析过程」偏差表。"""
+    from datetime import datetime
+
+    from src.database.schemas import SensorReading
+
+    _seed_machine(memory_db)
+    _seed_fmeca(memory_db)
+    # 再造一台健康设备并写入读数，保证全厂基线有参照样本
+    _seed_machine(memory_db, machine_id="CNC_037")
+    memory_db.insert_readings([SensorReading(
+        machine_id="CNC_037", timestamp=datetime(2025, 7, 14, 23, 30),
+        metrics={"op_temperature": 80.0, "vibration_rms": 1.8}, health_score=0.95)])
+    readings = [{"op_temperature": 80.0, "vibration_rms": 1.8} for _ in range(10)]
+    memory_db.save_diagnostic(
+        diagnostic_id="DIA-TEST-2", machine_id="CNC_036", status="completed",
+        severity="critical", confidence=0.9,
+        payload={
+            "rule": {"fault_code": 1, "fault_name": "主轴轴承磨损"},
+            "sensor_data": {"op_temperature": 99.0, "vibration_rms": 2.8},
+            "history": readings,
+            "anomaly_dims": ["op_temperature"],
+            "health_score": 0.44,
+            "anomaly_score": 0.56,
+            "anomaly_type": "gradual",
+        })
+
+    out = MaintenanceReportSkill(database=memory_db).run({"machine_id": "CNC_036", "diagnostic_id": "DIA-TEST-2"})
+    md = out["markdown"]
+    assert "三、数据分析过程" in md
+    # 表格列头 + 触发值都应出现在正文里（99 vs 基线 80 → 约 +23.8%）
+    assert "全厂同型基线" in md and "op_temperature" in md and "99.0000" in md
 
 
 def test_prev_maintenance_path_without_diagnostic(memory_db):

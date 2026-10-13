@@ -200,7 +200,7 @@ class Database:
 
         where = "WHERE m.status = ?" if status else ""
         params: tuple[str, ...] = (status,) if status else ()
-        query = f"""SELECT m.*, r.timestamp AS latest_timestamp, r.metrics_json, r.health_score,
+        query = f"""SELECT m.*, r.timestamp AS latest_timestamp, r.metrics_json, r.health_score, r.fault_code,
             d.id AS diagnostic_id, d.severity AS diagnostic_severity, d.confidence AS diagnostic_confidence
             FROM machines m
             LEFT JOIN sensor_readings r ON r.id = (SELECT id FROM sensor_readings WHERE machine_id=m.id ORDER BY timestamp DESC LIMIT 1)
@@ -529,6 +529,32 @@ class Database:
             )
         return report_id
 
+    def count_readings_for_machine(self, machine_id: str) -> int:
+        """返回某台设备的读数条数（用于重算前后核对影响面）。"""
+
+        with self.transaction() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM sensor_readings WHERE machine_id=?", (machine_id,)).fetchone()
+        return int(row["total"] if row else 0)
+
+    def delete_readings_for_machine(self, machine_id: str) -> int:
+        """删除某台设备的全部历史读数，返回删除条数。
+
+        仅供"定向重算"使用（例如仿真器补建征兆后只重跑故障设备）。WHERE 参数化，
+        避免误删整表；其余设备与 diagnostics/reports/messages 等表完全不受影响。
+        注意：绝不要用 regenerate.py 代替——它会 unlink 整个数据库文件。
+        """
+
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM sensor_readings WHERE machine_id=?", (machine_id,))
+        return int(cursor.rowcount or 0)
+
+    def delete_reports_for_machine(self, machine_id: str) -> int:
+        """删除某台设备的全部维护报告，返回删除条数（用于诊断刷新后重建报告）。"""
+
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM maintenance_reports WHERE machine_id=?", (machine_id,))
+        return int(cursor.rowcount or 0)
+
     def list_reports(self, machine_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
         """List maintenance reports, newest first, optionally filtered by machine."""
 
@@ -580,7 +606,7 @@ class Database:
         """Map a joined machine row into JSON-compatible data."""
 
         metrics = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
-        return {"id": row["id"], "model": row["model"], "manufacture_date": row["manufacture_date"], "last_maintenance": row["last_maintenance"], "next_maintenance": row["next_maintenance"], "last_repair": row["last_repair"], "daily_output": row["daily_output"], "unit_cost": row["unit_cost"], "production_line": row["production_line"], "status": row["status"], "latest_reading": {"timestamp": row["latest_timestamp"], "metrics": metrics, "health_score": row["health_score"]} if row["latest_timestamp"] else None, "latest_diagnostic": {"id": row["diagnostic_id"], "severity": row["diagnostic_severity"], "confidence": row["diagnostic_confidence"]} if row["diagnostic_id"] else None}
+        return {"id": row["id"], "model": row["model"], "manufacture_date": row["manufacture_date"], "last_maintenance": row["last_maintenance"], "next_maintenance": row["next_maintenance"], "last_repair": row["last_repair"], "daily_output": row["daily_output"], "unit_cost": row["unit_cost"], "production_line": row["production_line"], "status": row["status"], "latest_reading": {"timestamp": row["latest_timestamp"], "metrics": metrics, "fault_code": int(row["fault_code"] or 0), "health_score": row["health_score"]} if row["latest_timestamp"] else None, "latest_diagnostic": {"id": row["diagnostic_id"], "severity": row["diagnostic_severity"], "confidence": row["diagnostic_confidence"]} if row["diagnostic_id"] else None}
 
     @staticmethod
     def _fmeca_row(row: sqlite3.Row) -> dict[str, object]:
